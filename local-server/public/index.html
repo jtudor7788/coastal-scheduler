@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coastal Cleaning Scheduler</title>
+<style>
+  :root { --teal:#0e7c86; --teal-d:#0a5d65; --bg:#f3f7f8; --card:#fff; --ink:#17282b; --mute:#66797c; --line:#dbe5e7; --ok:#2e9d5b; --warn:#d9822b; --bad:#c0392b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:var(--teal); color:#fff; padding:12px 16px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:5; }
+  header h1 { font-size:18px; margin:0; }
+  header button { background:rgba(255,255,255,.18); color:#fff; border:0; padding:6px 12px; border-radius:8px; }
+  main { max-width:900px; margin:0 auto; padding:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
+  .card h2 { margin:0 0 10px; font-size:17px; }
+  label { display:block; font-size:13px; color:var(--mute); margin:8px 0 3px; }
+  input, select, textarea { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font:inherit; background:#fff; }
+  button { font:inherit; cursor:pointer; }
+  .btn { background:var(--teal); color:#fff; border:0; padding:10px 16px; border-radius:8px; font-weight:600; }
+  .btn:hover { background:var(--teal-d); }
+  .btn.sec { background:#e8f0f1; color:var(--ink); }
+  .btn.danger { background:#fbe9e7; color:var(--bad); }
+  .btn.sm { padding:5px 10px; font-size:13px; }
+  .row { display:flex; gap:10px; flex-wrap:wrap; } .row > * { flex:1; min-width:120px; }
+  .tabs { display:flex; gap:6px; margin-bottom:14px; flex-wrap:wrap; }
+  .tabs button { flex:1; padding:10px; border:1px solid var(--line); background:#fff; border-radius:8px; font-weight:600; }
+  .tabs button.on { background:var(--teal); color:#fff; border-color:var(--teal); }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; }
+  .chip { border:1px solid var(--line); background:#fff; border-radius:10px; padding:8px 10px; text-align:center; min-width:62px; line-height:1.2; }
+  .chip small { display:block; color:var(--mute); font-size:11px; }
+  .chip.on { background:var(--teal); border-color:var(--teal); color:#fff; } .chip.on small { color:#d7f0f2; }
+  .chip.posted { border-color:var(--ok); } .chip.posted::after { content:'✓'; color:var(--ok); font-size:12px; display:block; }
+  .chip.on.posted::after { color:#fff; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:99px; font-size:12px; font-weight:600; }
+  .open { background:#fff3e0; color:var(--warn); } .assigned { background:#e3f2fd; color:#1565c0; }
+  .confirmed { background:#e6f4ea; color:var(--ok); } .done { background:#eee; color:#666; }
+  .day { border-top:1px solid var(--line); padding:12px 0; } .day:first-child { border-top:0; }
+  .day h3 { margin:0 0 6px; font-size:15px; }
+  .avail { font-size:13px; color:var(--mute); margin-bottom:8px; }
+  .avail b { color:var(--ink); font-weight:600; }
+  .clean { background:#f8fbfb; border:1px solid var(--line); border-left:4px solid var(--warn); border-radius:8px; padding:10px; margin:8px 0; }
+  .clean.assigned, .clean.confirmed { border-left-color:var(--ok); }
+  .clean .t { font-weight:600; } .clean .m { color:var(--mute); font-size:13px; }
+  .actions { display:flex; gap:6px; flex-wrap:wrap; margin-top:8px; align-items:center; }
+  .nav { display:flex; align-items:center; justify-content:space-between; margin-bottom:10px; gap:8px; }
+  .err { color:var(--bad); font-size:14px; min-height:20px; margin-top:6px; }
+  .empty { color:var(--mute); font-style:italic; }
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.45); display:flex; align-items:flex-end; justify-content:center; z-index:10; }
+  .modal > div { background:#fff; width:100%; max-width:520px; border-radius:16px 16px 0 0; padding:16px; max-height:85vh; overflow:auto; }
+  .cand { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 0; border-bottom:1px solid var(--line); }
+  .cand .w { font-size:12px; color:var(--mute); } .cand .flag { color:var(--warn); font-size:12px; }
+  @media (min-width:700px){ .modal { align-items:center; } .modal > div { border-radius:16px; } }
+</style>
+</head>
+<body>
+<header><h1>🌊 Coastal Cleaning Scheduler</h1><button id="logout" hidden>Sign out</button></header>
+<main id="app"></main>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let session = JSON.parse(localStorage.getItem('session') || 'null');
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { method: opts.method || 'GET',
+    headers: { 'Content-Type': 'application/json', ...(session ? { Authorization: 'Bearer ' + session.token } : {}) },
+    body: opts.body ? JSON.stringify(opts.body) : undefined });
+  const data = await r.json().catch(() => ({}));
+  if (r.status === 401 && session) { logout(); throw new Error('Session expired'); }
+  if (!r.ok) { const e = new Error(data.error || 'Request failed'); e.data = data; e.status = r.status; throw e; }
+  return data;
+}
+function logout() { session = null; localStorage.removeItem('session'); render(); }
+$('#logout').onclick = logout;
+
+// dates (local, avoids UTC off-by-one)
+const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+const parse = s => { const [y,m,d] = s.split('-').map(Number); return new Date(y, m-1, d); };
+const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate()+n); return x; };
+const dow = d => d.toLocaleDateString(undefined, { weekday: 'short' });
+const pretty = s => parse(s).toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+const t12 = t => { let [h,m] = t.split(':').map(Number); const ap = h >= 12 ? 'PM' : 'AM'; h = h % 12 || 12; return `${h}:${String(m).padStart(2,'0')} ${ap}`; };
+const mondayOf = d => { const x = new Date(d); x.setDate(x.getDate() - ((x.getDay() + 6) % 7)); return x; };
+
+function render() {
+  $('#logout').hidden = !session;
+  if (!session) return loginView();
+  session.role === 'admin' ? adminView() : cleanerView();
+}
+
+// ---------------- login ----------------
+async function loginView() {
+  const cleaners = await fetch('/api/cleaners/public').then(r => r.json());
+  $('#app').innerHTML = `
+    <div class="tabs"><button id="tc" class="on">Cleaner</button><button id="ta">Nicole (Admin)</button></div>
+    <div class="card" id="lc">
+      <h2>Cleaner sign in</h2>
+      <label>Your name</label>
+      <select id="cn">${cleaners.length ? cleaners.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('') : '<option value="">No cleaners added yet</option>'}</select>
+      <label>PIN</label><input id="pin" type="password" inputmode="numeric" autocomplete="current-password">
+      <div class="err" id="lerr"></div>
+      <button class="btn" id="go">Sign in</button>
+    </div>
+    <div class="card" id="la" hidden>
+      <h2>Admin sign in</h2>
+      <label>Password</label><input id="pw" type="password" autocomplete="current-password">
+      <div class="err" id="aerr"></div>
+      <button class="btn" id="goa">Sign in</button>
+    </div>`;
+  $('#tc').onclick = () => { $('#lc').hidden = false; $('#la').hidden = true; $('#tc').classList.add('on'); $('#ta').classList.remove('on'); };
+  $('#ta').onclick = () => { $('#lc').hidden = true; $('#la').hidden = false; $('#ta').classList.add('on'); $('#tc').classList.remove('on'); };
+  const done = s => { session = s; localStorage.setItem('session', JSON.stringify(s)); render(); };
+  $('#go').onclick = async () => { try { done(await api('/api/login/cleaner', { method:'POST', body:{ cleaner_id: +$('#cn').value, pin: $('#pin').value } })); } catch (e) { $('#lerr').textContent = e.message; } };
+  $('#goa').onclick = async () => { try { done(await api('/api/login/admin', { method:'POST', body:{ password: $('#pw').value } })); } catch (e) { $('#aerr').textContent = e.message; } };
+  $('#pin').onkeydown = e => e.key === 'Enter' && $('#go').click();
+  $('#pw').onkeydown = e => e.key === 'Enter' && $('#goa').click();
+}
+
+// ---------------- cleaner ----------------
+async function cleanerView() {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const days = Array.from({ length: 28 }, (_, i) => addDays(today, i));
+  const [avail, cleans] = await Promise.all([api('/api/me/availability'), api('/api/me/cleans')]);
+  const posted = new Map(avail.map(a => [a.date, a]));
+  const picked = new Set();
+
+  $('#app').innerHTML = `
+    <div class="card"><h2>Hi ${esc(session.name)} 👋</h2>
+      <div id="mine"></div></div>
+    <div class="card"><h2>Post days you can work</h2>
+      <div class="chips" id="chips">${days.map(d => `<button class="chip ${posted.has(iso(d)) ? 'posted' : ''}" data-d="${iso(d)}">${dow(d)}<br><b>${d.getMonth()+1}/${d.getDate()}</b></button>`).join('')}</div>
+      <div class="row"><div><label>From</label><input type="time" id="st" value="08:00"></div><div><label>Until</label><input type="time" id="et" value="17:00"></div></div>
+      <label>Note (optional)</label><input id="note" placeholder="e.g. need to be done by 3 for pickup">
+      <div class="err" id="err"></div>
+      <button class="btn" id="save">Post selected days</button>
+    </div>
+    <div class="card"><h2>Days I've posted</h2><div id="posted"></div></div>`;
+
+  $('#mine').innerHTML = cleans.length ? cleans.map(c => `
+    <div class="clean ${c.status}"><div class="t">${pretty(c.date)} · ${t12(c.start_time)} <span class="pill ${c.status}">${c.status}</span></div>
+      <div class="m">${esc(c.client)} — ${esc(c.type)} (~${c.duration_hours}h)</div>
+      <div class="m">${esc(c.address)}</div>${c.notes ? `<div class="m">📝 ${esc(c.notes)}</div>` : ''}
+      ${c.status === 'assigned' ? `<div class="actions"><button class="btn sm" data-confirm="${c.id}">Confirm I'll be there</button></div>` : ''}
+    </div>`).join('') : '<div class="empty">No cleans assigned to you yet.</div>';
+  $('#mine').querySelectorAll('[data-confirm]').forEach(b => b.onclick = async () => { await api(`/api/me/cleans/${b.dataset.confirm}/confirm`, { method:'POST' }); cleanerView(); });
+
+  $('#posted').innerHTML = avail.length ? avail.map(a => `
+    <div class="cand"><div><b>${pretty(a.date)}</b><div class="w">${t12(a.start_time)} – ${t12(a.end_time)}${a.note ? ' · ' + esc(a.note) : ''}</div></div>
+    <button class="btn sm danger" data-rm="${a.date}">Remove</button></div>`).join('') : '<div class="empty">Nothing posted yet.</div>';
+  $('#posted').querySelectorAll('[data-rm]').forEach(b => b.onclick = async () => {
+    try { await api('/api/me/availability/' + b.dataset.rm, { method:'DELETE' }); cleanerView(); } catch (e) { alert(e.message); } });
+
+  $('#chips').onclick = e => { const b = e.target.closest('.chip'); if (!b) return;
+    picked.has(b.dataset.d) ? picked.delete(b.dataset.d) : picked.add(b.dataset.d); b.classList.toggle('on'); };
+  $('#save').onclick = async () => {
+    try { await api('/api/me/availability', { method:'POST', body:{ dates:[...picked], start_time:$('#st').value, end_time:$('#et').value, note:$('#note').value } }); cleanerView(); }
+    catch (e) { $('#err').textContent = e.message; } };
+}
+
+// ---------------- admin ----------------
+let adminTab = 'board', weekStart = mondayOf(new Date());
+
+function adminView() {
+  $('#app').innerHTML = `
+    <div class="tabs"><button data-t="board">Schedule</button><button data-t="cleaners">Cleaners</button></div>
+    <div id="body"></div>`;
+  document.querySelectorAll('.tabs button').forEach(b => { b.classList.toggle('on', b.dataset.t === adminTab); b.onclick = () => { adminTab = b.dataset.t; adminView(); }; });
+  adminTab === 'board' ? boardView() : cleanersView();
+}
+
+async function boardView() {
+  const from = iso(weekStart), to = iso(addDays(weekStart, 6));
+  const { cleans, availability } = await api(`/api/admin/board?from=${from}&to=${to}`);
+  const open = cleans.filter(c => c.status === 'open').length;
+  let html = `
+    <div class="nav"><button class="btn sec sm" id="prev">◀ Prev</button>
+      <div style="text-align:center"><b>${parse(from).toLocaleDateString(undefined,{month:'short',day:'numeric'})} – ${parse(to).toLocaleDateString(undefined,{month:'short',day:'numeric'})}</b>
+      <div class="m" style="color:var(--mute);font-size:13px">${cleans.length} cleans · ${open} need a cleaner</div></div>
+      <button class="btn sec sm" id="next">Next ▶</button></div>
+    <div class="card"><button class="btn" id="addclean">＋ Post a clean</button></div><div class="card">`;
+  for (let i = 0; i < 7; i++) {
+    const ds = iso(addDays(weekStart, i));
+    const av = availability.filter(a => a.date === ds);
+    const dc = cleans.filter(c => c.date === ds);
+    html += `<div class="day"><h3>${pretty(ds)}</h3>
+      <div class="avail">${av.length ? 'Available: ' + av.map(a => `<b>${esc(a.name)}</b> ${t12(a.start_time)}–${t12(a.end_time)}`).join(' · ') : 'No one posted'}</div>
+      ${dc.map(c => `<div class="clean ${c.status}">
+        <div class="t">${t12(c.start_time)} · ${esc(c.client)} <span class="pill ${c.status}">${c.status}</span></div>
+        <div class="m">${esc(c.type)} · ~${c.duration_hours}h${c.address ? ' · ' + esc(c.address) : ''}</div>
+        ${c.notes ? `<div class="m">📝 ${esc(c.notes)}</div>` : ''}
+        ${c.cleaner_name ? `<div class="m">👤 <b>${esc(c.cleaner_name)}</b></div>` : ''}
+        <div class="actions">
+          ${c.cleaner_id ? `<button class="btn sm sec" data-un="${c.id}">Unassign</button>` : `<button class="btn sm" data-as="${c.id}">Assign</button>`}
+          <button class="btn sm sec" data-ed="${c.id}">Edit</button>
+          ${c.status === 'confirmed' || c.status === 'assigned' ? `<button class="btn sm sec" data-done="${c.id}">Mark done</button>` : ''}
+          <button class="btn sm danger" data-cx="${c.id}">Cancel</button>
+        </div></div>`).join('') || '<div class="empty">No cleans</div>'}
+    </div>`;
+  }
+  $('#body').innerHTML = html + '</div>';
+  const byId = Object.fromEntries(cleans.map(c => [c.id, c]));
+  $('#prev').onclick = () => { weekStart = addDays(weekStart, -7); boardView(); };
+  $('#next').onclick = () => { weekStart = addDays(weekStart, 7); boardView(); };
+  $('#addclean').onclick = () => cleanForm();
+  const on = (attr, fn) => document.querySelectorAll(`[${attr}]`).forEach(b => b.onclick = () => fn(+b.getAttribute(attr)));
+  on('data-as', id => assignModal(byId[id]));
+  on('data-ed', id => cleanForm(byId[id]));
+  on('data-un', async id => { await api(`/api/admin/cleans/${id}/unassign`, { method:'POST' }); boardView(); });
+  on('data-done', async id => { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'done' } }); boardView(); });
+  on('data-cx', async id => { if (confirm('Cancel this clean?')) { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'cancelled' } }); boardView(); } });
+}
+
+function modal(inner) {
+  const m = document.createElement('div'); m.className = 'modal';
+  m.innerHTML = `<div>${inner}</div>`; m.onclick = e => { if (e.target === m) m.remove(); };
+  document.body.appendChild(m); return m;
+}
+
+function cleanForm(c) {
+  const v = c || { date: iso(weekStart), start_time: '10:00', duration_hours: 2, type: 'Airbnb turnover', client: '', address: '', notes: '' };
+  const m = modal(`<h2>${c ? 'Edit' : 'Post'} clean</h2>
+    <div class="row"><div><label>Date</label><input type="date" id="f_date" value="${v.date}"></div><div><label>Start</label><input type="time" id="f_st" value="${v.start_time}"></div></div>
+    <div class="row"><div><label>Hours (est.)</label><input type="number" step="0.5" min="0.5" id="f_dur" value="${v.duration_hours}"></div>
+      <div><label>Type</label><select id="f_type">${['Airbnb turnover','Residential','Commercial','Carpet','Tile/grout','Upholstery','Deep clean','Other'].map(t => `<option ${t === v.type ? 'selected' : ''}>${t}</option>`).join('')}</select></div></div>
+    <label>Client / property</label><input id="f_client" value="${esc(v.client)}">
+    <label>Address</label><input id="f_addr" value="${esc(v.address)}">
+    <label>Notes (door codes, restock list…)</label><textarea id="f_notes" rows="2">${esc(v.notes)}</textarea>
+    <div class="err" id="f_err"></div>
+    <div class="actions"><button class="btn" id="f_save">Save</button><button class="btn sec" id="f_x">Close</button></div>`);
+  $('#f_x', m).onclick = () => m.remove();
+  $('#f_save', m).onclick = async () => {
+    const body = { date: $('#f_date', m).value, start_time: $('#f_st', m).value, duration_hours: +$('#f_dur', m).value, type: $('#f_type', m).value,
+      client: $('#f_client', m).value.trim(), address: $('#f_addr', m).value.trim(), notes: $('#f_notes', m).value.trim() };
+    try { await api(c ? `/api/admin/cleans/${c.id}` : '/api/admin/cleans', { method: c ? 'PATCH' : 'POST', body }); m.remove(); weekStart = mondayOf(parse(body.date)); boardView(); }
+    catch (e) { $('#f_err', m).textContent = e.message; }
+  };
+}
+
+async function assignModal(c) {
+  const cands = await api(`/api/admin/cleans/${c.id}/candidates`);
+  const m = modal(`<h2>Assign: ${esc(c.client)}</h2><div class="m" style="color:var(--mute)">${pretty(c.date)} · ${t12(c.start_time)} · ~${c.duration_hours}h</div>
+    <div id="cl">${cands.length ? cands.map(x => `<div class="cand"><div><b>${esc(x.name)}</b>
+      <div class="w">Hours ${x.window}${x.note ? ' · ' + esc(x.note) : ''} · ${x.jobs_that_day} job(s) that day</div>
+      ${!x.fits_window ? '<div class="flag">⚠ Outside their posted hours</div>' : ''}${x.conflict ? `<div class="flag">⚠ Overlaps ${esc(x.conflict)}</div>` : ''}</div>
+      <button class="btn sm" data-c="${x.cleaner_id}">Assign</button></div>`).join('') : '<p class="empty">Nobody posted this day.</p>'}</div>
+    <div class="actions"><select id="any" style="flex:1"><option value="">Assign someone who didn't post…</option></select><button class="btn sec sm" id="anygo">Assign anyway</button></div>
+    <div class="err" id="a_err"></div><div class="actions"><button class="btn sec" id="a_x">Close</button></div>`);
+  const all = await api('/api/admin/cleaners');
+  $('#any', m).innerHTML += all.filter(a => a.active).map(a => `<option value="${a.id}">${esc(a.name)}</option>`).join('');
+  $('#a_x', m).onclick = () => m.remove();
+  const go = async (id, force) => {
+    try { await api(`/api/admin/cleans/${c.id}/assign`, { method:'POST', body:{ cleaner_id: id, force } }); m.remove(); boardView(); }
+    catch (e) { if (e.data?.needs_force && confirm(e.message + '\n\nAssign anyway?')) go(id, true); else $('#a_err', m).textContent = e.message; }
+  };
+  m.querySelectorAll('[data-c]').forEach(b => b.onclick = () => go(+b.dataset.c, false));
+  $('#anygo', m).onclick = () => { const id = +$('#any', m).value; if (id) go(id, true); };
+}
+
+async function cleanersView() {
+  const list = await api('/api/admin/cleaners');
+  $('#body').innerHTML = `
+    <div class="card"><h2>Add cleaner</h2>
+      <div class="row"><div><label>Name</label><input id="n_name"></div><div><label>Phone</label><input id="n_phone" type="tel"></div><div><label>PIN (4-8 digits)</label><input id="n_pin" inputmode="numeric"></div></div>
+      <div class="err" id="n_err"></div><button class="btn" id="n_add">Add</button></div>
+    <div class="card"><h2>Cleaners</h2>${list.map(c => `<div class="cand"><div><b>${esc(c.name)}</b> ${c.active ? '' : '<span class="pill done">inactive</span>'}
+      <div class="w">${esc(c.phone || 'no phone')} · PIN ${esc(c.pin)}</div></div>
+      <div class="actions"><button class="btn sm sec" data-pin="${c.id}">New PIN</button><button class="btn sm ${c.active ? 'danger' : 'sec'}" data-act="${c.id}" data-v="${c.active ? 0 : 1}">${c.active ? 'Deactivate' : 'Reactivate'}</button></div></div>`).join('') || '<div class="empty">No cleaners yet. Add one above.</div>'}</div>`;
+  $('#n_add').onclick = async () => { try { await api('/api/admin/cleaners', { method:'POST', body:{ name:$('#n_name').value, phone:$('#n_phone').value, pin:$('#n_pin').value } }); cleanersView(); } catch (e) { $('#n_err').textContent = e.message; } };
+  document.querySelectorAll('[data-pin]').forEach(b => b.onclick = async () => { const pin = prompt('New PIN (4-8 digits)'); if (!pin) return;
+    try { await api('/api/admin/cleaners/' + b.dataset.pin, { method:'PATCH', body:{ pin } }); cleanersView(); } catch (e) { alert(e.message); } });
+  document.querySelectorAll('[data-act]').forEach(b => b.onclick = async () => { await api('/api/admin/cleaners/' + b.dataset.act, { method:'PATCH', body:{ active: +b.dataset.v } }); cleanersView(); });
+}
+
+render();
+</script>
+</body>
+</html>

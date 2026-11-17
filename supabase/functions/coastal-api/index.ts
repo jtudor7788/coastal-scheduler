@@ -109,6 +109,17 @@ async function generateRecurring() {
     WHERE r.active AND (d::date - r.start_date) % (7 * r.every_weeks) = 0 AND (r.end_date IS NULL OR d::date <= r.end_date)
     ON CONFLICT (rule_id, date) WHERE rule_id IS NOT NULL DO NOTHING`;
 }
+async function fillUsual(me: number, reset = false) {
+  const [t] = await sql`SELECT weekdays, to_char(start_time,'HH24:MI') AS st, to_char(end_time,'HH24:MI') AS et, filled_through::text AS ft FROM coastal.availability_templates WHERE cleaner_id = ${me}`;
+  if (!t || !t.weekdays.length) return;
+  const from = reset || !t.ft ? today() : t.ft;
+  await sql`INSERT INTO coastal.availability (cleaner_id, date, start_time, end_time, note)
+    SELECT ${me}, d::date, ${t.st}::time, ${t.et}::time, 'usual week'
+    FROM generate_series(${from}::date + (CASE WHEN ${reset || !t.ft} THEN 0 ELSE 1 END), ${today()}::date + 28, interval '1 day') d
+    WHERE extract(dow FROM d)::int = ANY(string_to_array(${(t.weekdays as number[]).join(",")}, ',')::int[]) AND d::date >= ${today()}::date
+    ON CONFLICT (cleaner_id, date) DO NOTHING`;
+  await sql`UPDATE coastal.availability_templates SET filled_through = ${today()}::date + 28 WHERE cleaner_id = ${me}`;
+}
 const clipText = (v: unknown, n: number) => String(v ?? "").trim().slice(0, n);
 // Client link works once the report is published, or once Nicole has messaged the owner about this clean.
 async function clientClean(t: string) {
@@ -242,7 +253,21 @@ Deno.serve(async (req) => {
       if (user.role !== "cleaner") return bad("Not allowed", 403);
       const me = user.id as number;
 
+      if (path === "/api/me/usual" && method === "GET") {
+        const [t] = await sql`SELECT weekdays, to_char(start_time,'HH24:MI') AS start_time, to_char(end_time,'HH24:MI') AS end_time FROM coastal.availability_templates WHERE cleaner_id = ${me}`;
+        return json(t ?? { weekdays: [], start_time: "08:00", end_time: "17:00" });
+      }
+      if (path === "/api/me/usual" && method === "POST") {
+        const days = (Array.isArray(body.weekdays) ? body.weekdays : []).map(Number).filter((n: number) => n >= 0 && n <= 6);
+        const st = body.start_time || "08:00", et = body.end_time || "17:00";
+        if (!TIME_RE.test(st) || !TIME_RE.test(et) || toMin(et) <= toMin(st)) return bad("Bad times");
+        await sql`INSERT INTO coastal.availability_templates (cleaner_id, weekdays, start_time, end_time, filled_through) VALUES (${me}, string_to_array(${days.join(",")}, ',')::int[], ${st}, ${et}, NULL)
+          ON CONFLICT (cleaner_id) DO UPDATE SET weekdays = EXCLUDED.weekdays, start_time = EXCLUDED.start_time, end_time = EXCLUDED.end_time, filled_through = NULL`;
+        await fillUsual(me, true);
+        return json({ ok: true });
+      }
       if (path === "/api/me/availability" && method === "GET") {
+        await fillUsual(me);
         const from = url.searchParams.get("from") || today();
         return json(await sql`SELECT ${AVAIL_COLS} FROM coastal.availability a WHERE a.cleaner_id = ${me} AND a.date >= ${from} ORDER BY a.date`);
       }
@@ -347,6 +372,9 @@ Deno.serve(async (req) => {
           const tasks = await ensureTasks(c.id);
           const left = tasks.filter((t: any) => !t.done).length;
           if (left) return bad(`Finish the checklist first (${left} task${left === 1 ? "" : "s"} left)`, 409);
+          const kinds = await sql`SELECT DISTINCT kind FROM coastal.clean_media WHERE clean_id = ${c.id}`;
+          const have = new Set(kinds.map((k: any) => k.kind));
+          if (!have.has("before") || !have.has("after")) return bad("Add at least one BEFORE and one AFTER photo or video first (📷 Photos & video)", 409);
           await sql`UPDATE coastal.cleans SET clock_in = coalesce(clock_in, now()), clock_out = now(), status = 'done' WHERE id = ${c.id}`;
           return json({ ok: true });
         }
@@ -381,6 +409,31 @@ Deno.serve(async (req) => {
     // ---- admin ----
     if (path.startsWith("/api/admin/")) {
       if (user.role !== "admin") return bad("Not allowed", 403);
+
+      // ---- alerts (late / unfilled) ----
+      if (path === "/api/admin/alerts" && method === "GET") {
+        const rows = await sql`SELECT ${CLEAN_COLS}, cl.name AS cleaner_name, cl.phone AS cleaner_phone,
+          CASE WHEN c.cleaner_id IS NULL THEN 'unfilled' ELSE 'late' END AS kind
+          FROM coastal.cleans c LEFT JOIN coastal.cleaners cl ON cl.id = c.cleaner_id
+          WHERE (c.cleaner_id IS NOT NULL AND c.status IN ('assigned','confirmed') AND c.clock_in IS NULL
+                 AND c.date >= ${today()}::date - 3 AND (c.date < ${today()}::date OR (c.date = ${today()}::date AND c.start_time + interval '15 minutes' < (now() AT TIME ZONE 'America/New_York')::time)))
+             OR (c.cleaner_id IS NULL AND c.status = 'open' AND c.date BETWEEN ${today()}::date AND ${today()}::date + 2)
+          ORDER BY c.date, c.start_time`;
+        return json(rows);
+      }
+      // ---- history / search ----
+      if (path === "/api/admin/history" && method === "GET") {
+        const q = clipText(url.searchParams.get("q") ?? "", 80);
+        const like = "%" + q.replace(/[%_\\]/g, "\\$&") + "%";
+        return json(await sql`SELECT ${CLEAN_COLS}, cl.name AS cleaner_name, cl.phone AS cleaner_phone,
+          (SELECT count(*) FROM coastal.clean_media mm WHERE mm.clean_id = c.id)::int AS media_count,
+          (SELECT coalesce(sum(fee_cents),0) FROM coastal.clean_messages fm WHERE fm.clean_id = c.id AND fm.fee_status = 'approved')::int AS fees_approved_cents,
+          (SELECT count(*) FROM coastal.clean_messages fm WHERE fm.clean_id = c.id AND fm.fee_status = 'pending')::int AS fees_pending
+          FROM coastal.cleans c LEFT JOIN coastal.cleaners cl ON cl.id = c.cleaner_id
+          WHERE c.status != 'requested' AND (${q === ""} OR c.client ILIKE ${like} OR c.address ILIKE ${like} OR c.contact_name ILIKE ${like} OR cl.name ILIKE ${like}
+            OR EXISTS (SELECT 1 FROM coastal.properties p WHERE p.id = c.property_id AND p.name ILIKE ${like}))
+          ORDER BY c.date DESC, c.start_time DESC LIMIT 60`);
+      }
 
       // ---- properties ----
       if (path === "/api/admin/properties" && method === "GET")
@@ -551,7 +604,7 @@ Deno.serve(async (req) => {
       if (path === "/api/admin/board" && method === "GET") {
         const from = url.searchParams.get("from") ?? "", to = url.searchParams.get("to") ?? "";
         if (!DATE_RE.test(from) || !DATE_RE.test(to)) return bad("from/to required (YYYY-MM-DD)");
-        const cleans = await sql`SELECT ${CLEAN_COLS}, cl.name AS cleaner_name,
+        const cleans = await sql`SELECT ${CLEAN_COLS}, cl.name AS cleaner_name, cl.phone AS cleaner_phone,
           (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'crew' AND mm.sender = 'cleaner' AND NOT mm.seen)::int AS unread_crew,
           (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'client' AND mm.sender = 'client' AND NOT mm.seen)::int AS unread_client,
           (SELECT count(*) FROM coastal.clean_tasks t WHERE t.clean_id = c.id)::int AS tasks_total,

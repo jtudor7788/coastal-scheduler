@@ -76,6 +76,17 @@
   .task input { width:22px; height:22px; flex:none; } .task.done span { color:var(--mute); text-decoration:line-through; }
   .task button { margin-left:auto; background:none; border:0; color:var(--bad); font-size:20px; }
   .hint { color:var(--mute); font-size:13px; }
+  .cal { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; }
+  .cal .h { text-align:center; font-size:11px; color:var(--mute); font-weight:600; }
+  .cal .d { border:1px solid var(--line); border-radius:8px; min-height:62px; padding:3px; font-size:11px; background:#fff; overflow:hidden; }
+  .cal .d.av { background:#eaf7ee; border-color:#bfe3cb; } .cal .d.today { outline:2px solid var(--teal); }
+  .cal .d .n { font-weight:700; color:var(--mute); } .cal .d .j { background:var(--teal); color:#fff; border-radius:4px; padding:1px 3px; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .cal .d .j.done { background:#8aa; } .cal .d.out { opacity:.45; }
+  .grid7 { display:grid; grid-template-columns:90px repeat(7,1fr); gap:3px; font-size:12px; align-items:stretch; }
+  .grid7 > div { padding:5px 3px; border-radius:6px; background:#fff; border:1px solid var(--line); text-align:center; }
+  .grid7 .hd { background:#e8f0f1; font-weight:700; } .grid7 .nm { text-align:left; font-weight:600; }
+  .grid7 .yes { background:#eaf7ee; border-color:#bfe3cb; } .grid7 .need { background:#fbe9e7; color:var(--bad); font-weight:700; }
+  .alertcard { border-color:var(--bad) !important; background:#fff7f6; }
 </style>
 </head>
 <body>
@@ -148,7 +159,7 @@ async function loginView() {
 async function cleanerView() {
   const today = new Date(); today.setHours(0,0,0,0);
   const days = Array.from({ length: 28 }, (_, i) => addDays(today, i));
-  const [avail, cleans] = await Promise.all([api('/api/me/availability'), api('/api/me/cleans?from=' + iso(addDays(today, -7)))]);
+  const [avail, cleans, usual] = await Promise.all([api('/api/me/availability'), api('/api/me/cleans?from=' + iso(addDays(today, -7))), api('/api/me/usual')]);
   const cmap = Object.fromEntries(cleans.map(c => [c.id, c]));
   const posted = new Map(avail.map(a => [a.date, a]));
   const picked = new Set();
@@ -156,7 +167,12 @@ async function cleanerView() {
   $('#app').innerHTML = `
     <div class="card"><h2>Hi ${esc(session.name)} 👋</h2>
       <div id="mine"></div></div>
-    <div class="card"><h2>Post days you can work</h2>
+    <div class="card"><h2>📅 My calendar</h2><div id="cal"></div><div class="hint" style="margin-top:6px">Green = you're available. Teal = a clean you're assigned.</div></div>
+    <div class="card"><h2>🔁 My usual week</h2><div class="hint" style="margin-bottom:8px">Tap the days you normally work. We'll fill in the next 4 weeks for you automatically. After that, just remove any day you can't make.</div>
+      <div class="chips" id="uchips">${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map((n, i) => `<button class="chip ${usual.weekdays.includes(i) ? 'on' : ''}" data-w="${i}">${n}</button>`).join('')}</div>
+      <div class="row"><div><label>From</label><input type="time" id="ust" value="${usual.start_time}"></div><div><label>Until</label><input type="time" id="uet" value="${usual.end_time}"></div></div>
+      <div class="err" id="uerr"></div><button class="btn" id="usave">Save my usual week</button></div>
+    <div class="card"><h2>Post or change individual days</h2>
       <div class="chips" id="chips">${days.map(d => `<button class="chip ${posted.has(iso(d)) ? 'posted' : ''}" data-d="${iso(d)}">${dow(d)}<br><b>${d.getMonth()+1}/${d.getDate()}</b></button>`).join('')}</div>
       <div class="row"><div><label>From</label><input type="time" id="st" value="08:00"></div><div><label>Until</label><input type="time" id="et" value="17:00"></div></div>
       <label>Note (optional)</label><input id="note" placeholder="e.g. need to be done by 3 for pickup">
@@ -165,6 +181,10 @@ async function cleanerView() {
     </div>
     <div class="card"><h2>Days I've posted</h2><div id="posted"></div></div>`;
 
+  const uset = new Set(usual.weekdays);
+  $('#uchips').onclick = e => { const b = e.target.closest('.chip'); if (!b) return; const w = +b.dataset.w; uset.has(w) ? uset.delete(w) : uset.add(w); b.classList.toggle('on'); };
+  $('#usave').onclick = async () => { try { await api('/api/me/usual', { method:'POST', body:{ weekdays:[...uset], start_time:$('#ust').value, end_time:$('#uet').value } }); cleanerView(); } catch (e) { $('#uerr').textContent = e.message; } };
+  $('#cal').innerHTML = calendarHtml(cleans, avail);
   $('#mine').innerHTML = cleans.length ? cleans.map(c => `
     <div class="clean ${c.status}"><div class="t">${pretty(c.date)} · ${t12(c.start_time)} <span class="pill ${c.status}">${c.status}</span></div>
       <div class="m">${esc(c.client)} — ${esc(c.type)} (~${c.duration_hours}h)</div>
@@ -204,28 +224,34 @@ async function cleanerView() {
 }
 
 // ---------------- admin ----------------
-let adminTab = 'board', weekStart = mondayOf(new Date());
+let adminTab = 'board', weekStart = mondayOf(new Date()), histQ = '';
+const refresh = () => ({ board: boardView, team: teamView, history: historyView, props: propsView, supplies: suppliesView, cleaners: cleanersView })[adminTab]();
 
 function adminView() {
   $('#app').innerHTML = `
-    <div class="tabs"><button data-t="board">Schedule</button><button data-t="props">Properties</button><button data-t="supplies" id="suptab">Supplies</button><button data-t="cleaners">Cleaners</button></div>
+    <div class="tabs"><button data-t="board">Schedule</button><button data-t="team">Team</button><button data-t="history">History</button><button data-t="props">Properties</button><button data-t="supplies" id="suptab">Supplies</button><button data-t="cleaners">Cleaners</button></div>
     <div id="body"></div>`;
   api('/api/admin/supplies').then(l => { const n = l.filter(x => x.status === 'open').length; if (n && $('#suptab')) $('#suptab').innerHTML = `Supplies<span class="badge">${n}</span>`; }).catch(() => {});
   document.querySelectorAll('.tabs button').forEach(b => { b.classList.toggle('on', b.dataset.t === adminTab); b.onclick = () => { adminTab = b.dataset.t; adminView(); }; });
-  ({ board: boardView, props: propsView, supplies: suppliesView, cleaners: cleanersView })[adminTab]();
+  refresh();
 }
 
+setInterval(() => { if (session?.role === 'admin' && adminTab === 'board' && !document.querySelector('.modal') && !document.hidden) boardView(); }, 60000);
 let genDone = false;
 async function boardView() {
   if (!genDone) { genDone = true; await api('/api/admin/recurring/generate', { method:'POST' }).catch(() => {}); }
   const from = iso(weekStart), to = iso(addDays(weekStart, 6));
-  const [{ cleans, availability }, requests] = await Promise.all([api(`/api/admin/board?from=${from}&to=${to}`), api('/api/admin/requests')]);
+  const [{ cleans, availability }, requests, alerts] = await Promise.all([api(`/api/admin/board?from=${from}&to=${to}`), api('/api/admin/requests'), api('/api/admin/alerts').catch(() => [])]);
   const open = cleans.filter(c => c.status === 'open').length;
   let html = `
     <div class="nav"><button class="btn sec sm" id="prev">◀ Prev</button>
       <div style="text-align:center"><b>${parse(from).toLocaleDateString(undefined,{month:'short',day:'numeric'})} – ${parse(to).toLocaleDateString(undefined,{month:'short',day:'numeric'})}</b>
       <div class="m" style="color:var(--mute);font-size:13px">${cleans.length} cleans · ${open} need a cleaner</div></div>
       <button class="btn sec sm" id="next">Next ▶</button></div>
+    ${alerts.length ? `<div class="card alertcard"><h2>🚨 Needs attention (${alerts.length})</h2>${alerts.map(a => `<div class="cand"><div>
+      ${a.kind === 'late' ? `<b>⏰ ${esc(a.cleaner_name)} hasn't clocked in</b>` : `<b>🔴 Still needs a cleaner</b>`}
+      <div class="w">${esc(a.client)} · ${pretty(a.date)} ${t12(a.start_time)}${a.release_note && a.kind === 'unfilled' ? ' · ' + esc(a.release_note) : ''}</div></div>
+      <div class="actions">${a.kind === 'late' ? `${a.cleaner_phone ? `<a class="btn sm" href="sms:${esc(a.cleaner_phone.replace(/[^\d+]/g, ''))}?&body=${encodeURIComponent('Hi ' + a.cleaner_name + ', are you on your way to ' + a.client + '? It was scheduled for ' + t12(a.start_time) + '.')}" style="text-decoration:none">💬 Text</a><a class="btn sm sec" href="tel:${esc(a.cleaner_phone.replace(/[^\d+]/g, ''))}" style="text-decoration:none">📞 Call</a>` : ''}<button class="btn sm sec" data-as="${a.id}">Reassign</button>` : `<button class="btn sm" data-as="${a.id}">Assign</button>`}</div></div>`).join('')}</div>` : ''}
     ${requests.length ? `<div class="card" style="border-color:var(--warn)"><h2>📥 Client requests (${requests.length})</h2>
       ${requests.map(r => `<div class="clean">
         <div class="t">${pretty(r.date)} · ${t12(r.start_time)} · ${esc(r.type)}</div>
@@ -263,7 +289,7 @@ async function boardView() {
     </div>`;
   }
   $('#body').innerHTML = html + '</div>';
-  const byId = Object.fromEntries([...cleans, ...requests].map(c => [c.id, c]));
+  const byId = Object.fromEntries([...cleans, ...requests, ...alerts].map(c => [c.id, c]));
   $('#prev').onclick = () => { weekStart = addDays(weekStart, -7); boardView(); };
   $('#next').onclick = () => { weekStart = addDays(weekStart, 7); boardView(); };
   $('#addclean').onclick = () => cleanForm();
@@ -439,7 +465,7 @@ async function adminMediaModal(c) {
       <button class="btn sm sec" id="r_copy">Copy link</button><button class="btn sm sec" id="r_save">Save note</button><button class="btn sm danger" id="r_off">Unpublish</button></div>`
       : `<div class="actions"><button class="btn" id="r_pub">Publish report (makes link live)</button></div>
          <div class="m" style="color:var(--mute);font-size:13px;margin-top:6px">Nothing is visible to the client until you publish.</div>`;
-    const setPub = async (publish) => { try { await api(`/api/admin/cleans/${c.id}/report`, { method:'POST', body:{ publish, note: $('#rnote', m).value } }); drawState(publish); boardView(); } catch (e) { $('#rerr', m).textContent = e.message; } };
+    const setPub = async (publish) => { try { await api(`/api/admin/cleans/${c.id}/report`, { method:'POST', body:{ publish, note: $('#rnote', m).value } }); drawState(publish); refresh(); } catch (e) { $('#rerr', m).textContent = e.message; } };
     if (published) {
       const who = c.contact_name || c.client;
       const msg = () => `Hi ${who}, your ${c.type} at ${c.address || 'your property'} on ${pretty(c.date)} is complete. Here are the before and after photos and video:\n\n${link}\n\n${$('#rnote', m).value ? $('#rnote', m).value + '\n\n' : ''}Thank you for choosing Coastal Cleaning PSL!`;
@@ -494,7 +520,7 @@ async function chatModal(c, viewer, thread = 'crew') {
     } catch (e) { if (!closed) $('#cerr', m).textContent = e.message; }
   };
   const poll = setInterval(() => { if (!document.body.contains(m)) { clearInterval(poll); closed = true; return; } load(); }, 15000);
-  const close = () => { clearInterval(poll); closed = true; m.remove(); if (viewer === 'cleaner') cleanerView(); else boardView(); };
+  const close = () => { clearInterval(poll); closed = true; m.remove(); if (viewer === 'cleaner') cleanerView(); else refresh(); };
   m.onclick = e => { if (e.target === m) close(); };
   $('#cx', m).onclick = close;
   $('#cs', m).onclick = async () => {
@@ -523,7 +549,7 @@ async function cleanerTasksModal(c) {
   const m = modal(`<h2>Checklist</h2><div class="m hint">${esc(c.client)} · ${pretty(c.date)}</div><div id="tl"></div>
     <div class="err" id="terr"></div>
     <div class="actions">${locked ? '' : '<button class="btn" id="tfin">✔ Finish clean</button>'}<button class="btn sec" id="tx">Close</button></div>
-    ${locked ? '' : '<div class="hint" style="margin-top:6px">Tick every task, take your After photos/video, then tap Finish. That clocks you out.</div>'}`);
+    ${locked ? '' : '<div class="hint" style="margin-top:6px">Tick every task, upload at least one Before and one After photo/video (📷 Photos &amp; video), then tap Finish. That clocks you out.</div>'}`);
   const draw = () => { $('#tl', m).innerHTML = tasks.map(t => `<label class="task ${t.done ? 'done' : ''}" style="margin:0;color:inherit;font-size:16px"><input type="checkbox" data-id="${t.id}" ${t.done ? 'checked' : ''} ${locked ? 'disabled' : ''}><span>${esc(t.label)}</span></label>`).join('');
     m.querySelectorAll('input[data-id]').forEach(cb => cb.addEventListener('change', async () => {
       const t = tasks.find(x => x.id == cb.dataset.id); t.done = cb.checked;
@@ -558,7 +584,7 @@ async function adminTasksModal(c) {
     m.querySelectorAll('[data-d]').forEach(b => b.onclick = async () => { await api('/api/admin/tasks/' + b.dataset.d, { method:'DELETE' }); load(); }); };
   $('#ta', m).onclick = async () => { const label = $('#tn', m).value.trim(); if (!label) return;
     try { await api(`/api/admin/cleans/${c.id}/tasks`, { method:'POST', body:{ label } }); $('#tn', m).value = ''; load(); } catch (e) { $('#terr', m).textContent = e.message; } };
-  const close = () => { m.remove(); boardView(); };
+  const close = () => { m.remove(); refresh(); };
   m.onclick = e => { if (e.target === m) close(); }; $('#tx', m).onclick = close;
   load();
 }
@@ -637,6 +663,55 @@ $('#install').addEventListener('click', async () => {
   else modal('<h2>Add to your home screen</h2><p><b>iPhone / iPad (Safari):</b> tap the Share button, then <b>Add to Home Screen</b>.</p><p><b>Android (Chrome):</b> tap the ⋮ menu, then <b>Install app</b> / <b>Add to Home screen</b>.</p><div class="actions"><button class="btn" onclick="this.closest(\'.modal\').remove()">Got it</button></div>');
 });
 window.addEventListener('appinstalled', () => { $('#install').hidden = true; });
+
+// ---------------- calendar / team / history ----------------
+function calendarHtml(cleans, avail) {
+  const t0 = new Date(); t0.setHours(0,0,0,0); const start = mondayOf(t0);
+  const av = new Map(avail.map(a => [a.date, a])); const byDay = {};
+  cleans.filter(c => c.status !== 'cancelled').forEach(c => (byDay[c.date] = byDay[c.date] || []).push(c));
+  const short = t => { let [h, m] = t.split(':').map(Number); const ap = h >= 12 ? 'p' : 'a'; h = h % 12 || 12; return h + (m ? ':' + String(m).padStart(2,'0') : '') + ap; };
+  let out = `<div class="cal">${['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d => `<div class="h">${d}</div>`).join('')}`;
+  for (let i = 0; i < 28; i++) {
+    const d = addDays(start, i), ds = iso(d), a = av.get(ds), js = byDay[ds] || [];
+    out += `<div class="d ${a ? 'av' : ''} ${d < t0 ? 'out' : ''} ${ds === iso(t0) ? 'today' : ''}"><div class="n">${d.getMonth()+1}/${d.getDate()}</div>${a ? `<div style="color:#2e7d4f">${short(a.start_time)}–${short(a.end_time)}</div>` : ''}
+      ${js.map(c => `<div class="j ${c.status === 'done' ? 'done' : ''}" title="${esc(c.client)}">${short(c.start_time)} ${esc(c.client)}</div>`).join('')}</div>`;
+  }
+  return out + '</div>';
+}
+
+async function teamView() {
+  const from = iso(weekStart), to = iso(addDays(weekStart, 6));
+  const [{ cleans, availability }, cleaners] = await Promise.all([api(`/api/admin/board?from=${from}&to=${to}`), api('/api/admin/cleaners')]);
+  const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i));
+  const short = t => { let [h, m] = t.split(':').map(Number); const ap = h >= 12 ? 'p' : 'a'; h = h % 12 || 12; return h + (m ? ':' + String(m).padStart(2,'0') : '') + ap; };
+  $('#body').innerHTML = `<div class="nav"><button class="btn sec sm" id="prev">◀ Prev</button>
+    <div style="text-align:center"><b>Team availability</b><div class="m hint">${parse(from).toLocaleDateString(undefined,{month:'short',day:'numeric'})} – ${parse(to).toLocaleDateString(undefined,{month:'short',day:'numeric'})}</div></div>
+    <button class="btn sec sm" id="next">Next ▶</button></div>
+    <div class="card"><div class="grid7"><div class="hd"></div>${days.map(d => `<div class="hd">${dow(d)}<br>${d.getMonth()+1}/${d.getDate()}</div>`).join('')}
+    ${cleaners.filter(c => c.active).map(cl => `<div class="nm">${esc(cl.name)}</div>${days.map(d => {
+      const ds = iso(d), a = availability.find(x => x.cleaner_id == cl.id && x.date === ds), jobs = cleans.filter(c => c.cleaner_id == cl.id && c.date === ds);
+      return `<div class="${a ? 'yes' : ''}">${a ? short(a.start_time) + '–' + short(a.end_time) : '—'}${jobs.length ? `<br><b>${jobs.length} job${jobs.length > 1 ? 's' : ''}</b>` : ''}</div>`; }).join('')}`).join('')}
+    <div class="nm">Needs cleaner</div>${days.map(d => { const n = cleans.filter(c => c.date === iso(d) && !c.cleaner_id && c.status === 'open').length; return `<div class="${n ? 'need' : ''}">${n || ''}</div>`; }).join('')}</div>
+    <div class="hint" style="margin-top:8px">Green = posted availability (with jobs already booked). Red numbers = cleans with nobody assigned. Assign them from the Schedule tab.</div></div>`;
+  $('#prev').onclick = () => { weekStart = addDays(weekStart, -7); teamView(); };
+  $('#next').onclick = () => { weekStart = addDays(weekStart, 7); teamView(); };
+}
+
+async function historyView() {
+  $('#body').innerHTML = `<div class="card"><h2>🔎 Search history</h2><input id="hq" placeholder="Search client, property, address, or cleaner…" value="${esc(histQ)}"><div id="hr" style="margin-top:10px"></div></div>`;
+  const draw = async () => {
+    const list = await api('/api/admin/history?q=' + encodeURIComponent(histQ)); const byId = Object.fromEntries(list.map(c => [c.id, c]));
+    $('#hr').innerHTML = list.map(c => `<div class="clean ${c.status}"><div class="t">${pretty(c.date)} · ${esc(c.client)} <span class="pill ${c.status}">${c.status}</span></div>
+      <div class="m">${esc(c.type)}${c.address ? ' · ' + esc(c.address) : ''}${c.cleaner_name ? ' · 👤 ' + esc(c.cleaner_name) : ''}</div>
+      <div class="m hint">${c.clock_in && c.clock_out ? '⏱ ' + fmtDur(c.clock_in, c.clock_out) + ' (est. ' + c.duration_hours + 'h) · ' : ''}📷 ${c.media_count}${c.fees_approved_cents ? ' · 💲 fees approved $' + (c.fees_approved_cents / 100).toFixed(2) : ''}${c.fees_pending ? ' · ⏳ fee pending' : ''}</div>
+      <div class="actions"><button class="btn sm sec" data-hm="${c.id}">📷 Media / report</button><button class="btn sm sec" data-ho="${c.id}">💬 Owner</button>${c.cleaner_id ? `<button class="btn sm sec" data-hc="${c.id}">💬 Crew</button>` : ''}<button class="btn sm sec" data-hk="${c.id}">☑ Checklist</button></div></div>`).join('')
+      || '<div class="empty">No matches.</div>';
+    const on = (a, fn) => $('#hr').querySelectorAll(`[${a}]`).forEach(b => b.onclick = () => fn(byId[b.getAttribute(a)]));
+    on('data-hm', adminMediaModal); on('data-ho', c => chatModal(c, 'admin', 'client')); on('data-hc', c => chatModal(c, 'admin', 'crew')); on('data-hk', adminTasksModal);
+  };
+  let tmr; $('#hq').addEventListener('input', e => { histQ = e.target.value; clearTimeout(tmr); tmr = setTimeout(draw, 300); });
+  draw();
+}
 
 render();
 </script>

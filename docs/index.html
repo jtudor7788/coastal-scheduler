@@ -173,13 +173,20 @@ function adminView() {
 
 async function boardView() {
   const from = iso(weekStart), to = iso(addDays(weekStart, 6));
-  const { cleans, availability } = await api(`/api/admin/board?from=${from}&to=${to}`);
+  const [{ cleans, availability }, requests] = await Promise.all([api(`/api/admin/board?from=${from}&to=${to}`), api('/api/admin/requests')]);
   const open = cleans.filter(c => c.status === 'open').length;
   let html = `
     <div class="nav"><button class="btn sec sm" id="prev">◀ Prev</button>
       <div style="text-align:center"><b>${parse(from).toLocaleDateString(undefined,{month:'short',day:'numeric'})} – ${parse(to).toLocaleDateString(undefined,{month:'short',day:'numeric'})}</b>
       <div class="m" style="color:var(--mute);font-size:13px">${cleans.length} cleans · ${open} need a cleaner</div></div>
       <button class="btn sec sm" id="next">Next ▶</button></div>
+    ${requests.length ? `<div class="card" style="border-color:var(--warn)"><h2>📥 Client requests (${requests.length})</h2>
+      ${requests.map(r => `<div class="clean">
+        <div class="t">${pretty(r.date)} · ${t12(r.start_time)} · ${esc(r.type)}</div>
+        <div class="m"><b>${esc(r.contact_name)}</b>${r.contact_phone ? ' · <a href="tel:' + esc(r.contact_phone) + '">' + esc(r.contact_phone) + '</a>' : ''}${r.contact_email ? ' · <a href="mailto:' + esc(r.contact_email) + '">' + esc(r.contact_email) + '</a>' : ''}</div>
+        <div class="m">${esc(r.address)}</div>${r.notes ? `<div class="m">📝 ${esc(r.notes)}</div>` : ''}
+        <div class="actions"><button class="btn sm" data-ap="${r.id}">Approve → needs cleaner</button><button class="btn sm sec" data-ed="${r.id}">Edit</button><button class="btn sm danger" data-dc="${r.id}">Decline</button></div>
+      </div>`).join('')}</div>` : ''}
     <div class="card"><button class="btn" id="addclean">＋ Post a clean</button></div><div class="card">`;
   for (let i = 0; i < 7; i++) {
     const ds = iso(addDays(weekStart, i));
@@ -191,6 +198,7 @@ async function boardView() {
         <div class="t">${t12(c.start_time)} · ${esc(c.client)} <span class="pill ${c.status}">${c.status}</span></div>
         <div class="m">${esc(c.type)} · ~${c.duration_hours}h${c.address ? ' · ' + esc(c.address) : ''}</div>
         ${c.notes ? `<div class="m">📝 ${esc(c.notes)}</div>` : ''}
+        ${c.source === 'client' ? `<div class="m">☎ ${esc(c.contact_phone || c.contact_email || '')}</div>` : ''}
         ${c.cleaner_name ? `<div class="m">👤 <b>${esc(c.cleaner_name)}</b></div>` : ''}
         <div class="actions">
           ${c.cleaner_id ? `<button class="btn sm sec" data-un="${c.id}">Unassign</button>` : `<button class="btn sm" data-as="${c.id}">Assign</button>`}
@@ -201,13 +209,15 @@ async function boardView() {
     </div>`;
   }
   $('#body').innerHTML = html + '</div>';
-  const byId = Object.fromEntries(cleans.map(c => [c.id, c]));
+  const byId = Object.fromEntries([...cleans, ...requests].map(c => [c.id, c]));
   $('#prev').onclick = () => { weekStart = addDays(weekStart, -7); boardView(); };
   $('#next').onclick = () => { weekStart = addDays(weekStart, 7); boardView(); };
   $('#addclean').onclick = () => cleanForm();
   const on = (attr, fn) => document.querySelectorAll(`[${attr}]`).forEach(b => b.onclick = () => fn(+b.getAttribute(attr)));
   on('data-as', id => assignModal(byId[id]));
   on('data-ed', id => cleanForm(byId[id]));
+  on('data-ap', async id => { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'open' } }); boardView(); });
+  on('data-dc', async id => { if (confirm('Decline this request?')) { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'declined' } }); boardView(); } });
   on('data-un', async id => { await api(`/api/admin/cleans/${id}/unassign`, { method:'POST' }); boardView(); });
   on('data-done', async id => { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'done' } }); boardView(); });
   on('data-cx', async id => { if (confirm('Cancel this clean?')) { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'cancelled' } }); boardView(); } });

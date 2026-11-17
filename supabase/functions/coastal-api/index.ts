@@ -51,12 +51,13 @@ function safeEq(a: string, b: string) {
 
 // ---- login throttle (per instance, best effort) ----
 const fails = new Map<string, { n: number; t: number }>();
+const reqHits = new Map<string, number[]>();
 const throttled = (k: string) => { const f = fails.get(k); return !!f && f.n >= 8 && Date.now() - f.t < 600_000; };
 const noteFail = (k: string) => { const f = fails.get(k) ?? { n: 0, t: 0 }; fails.set(k, { n: f.n + 1, t: Date.now() }); };
 
 // ---- column fragments ----
 const CLEAN_COLS = sql`c.id, c.date::text AS date, to_char(c.start_time,'HH24:MI') AS start_time, c.duration_hours::float AS duration_hours,
-  c.client, c.address, c.type, c.notes, c.status, c.cleaner_id`;
+  c.client, c.address, c.type, c.notes, c.status, c.cleaner_id, c.contact_name, c.contact_phone, c.contact_email, c.source`;
 const AVAIL_COLS = sql`a.id, a.cleaner_id, a.date::text AS date, to_char(a.start_time,'HH24:MI') AS start_time, to_char(a.end_time,'HH24:MI') AS end_time, a.note`;
 
 async function candidatesFor(clean: any) {
@@ -97,6 +98,32 @@ Deno.serve(async (req) => {
     if (path === "/api/health") return json({ ok: true });
     if (path === "/api/cleaners/public" && method === "GET")
       return json(await sql`SELECT id, name FROM coastal.cleaners WHERE active ORDER BY name`);
+
+    if (path === "/api/public/request" && method === "POST") {
+      // Public client intake. Lands as status 'requested'; Nicole must approve before cleaners can see it.
+      if (body.website) return json({ ok: true }); // honeypot: bots fill this hidden field
+      const k = "req:" + ip;
+      const now = Date.now();
+      const hits = (reqHits.get(k) ?? []).filter((t) => now - t < 3600_000);
+      if (hits.length >= 5) return bad("Too many requests from this connection. Please call us instead.", 429);
+      const clip = (v: unknown, n: number) => String(v ?? "").trim().slice(0, n);
+      const b = {
+        contact_name: clip(body.contact_name, 100), contact_phone: clip(body.contact_phone, 30),
+        contact_email: clip(body.contact_email, 120), address: clip(body.address, 200),
+        type: clip(body.type, 40) || "Residential", notes: clip(body.notes, 1000),
+        date: clip(body.date, 10), start_time: clip(body.start_time, 5) || "10:00",
+      };
+      if (!b.contact_name) return bad("Please enter your name");
+      if (!b.contact_phone && !b.contact_email) return bad("Please enter a phone number or email so we can confirm");
+      if (b.contact_email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(b.contact_email)) return bad("That email doesn't look right");
+      if (!b.address) return bad("Please enter the address to be cleaned");
+      if (!DATE_RE.test(b.date) || b.date < today()) return bad("Please pick a date today or later");
+      if (!TIME_RE.test(b.start_time)) return bad("Bad time");
+      hits.push(now); reqHits.set(k, hits);
+      await sql`INSERT INTO coastal.cleans (date, start_time, duration_hours, client, address, type, notes, status, contact_name, contact_phone, contact_email, source)
+        VALUES (${b.date}, ${b.start_time}, 2, ${b.contact_name}, ${b.address}, ${b.type}, ${b.notes}, 'requested', ${b.contact_name}, ${b.contact_phone}, ${b.contact_email}, 'client')`;
+      return json({ ok: true });
+    }
 
     if (path === "/api/login/admin" && method === "POST") {
       const k = "admin:" + ip;
@@ -194,18 +221,21 @@ Deno.serve(async (req) => {
         const n = { ...c, ...body, id: c.id, cleaner_id: c.cleaner_id };
         const err = validateClean(n);
         if (err) return bad(err);
-        if (!["open", "assigned", "confirmed", "done", "cancelled"].includes(n.status)) return bad("Bad status");
+        if (!["requested", "declined", "open", "assigned", "confirmed", "done", "cancelled"].includes(n.status)) return bad("Bad status");
         await sql`UPDATE coastal.cleans SET date = ${n.date}, start_time = ${n.start_time}, duration_hours = ${n.duration_hours},
           client = ${n.client}, address = ${n.address ?? ""}, type = ${n.type}, notes = ${n.notes ?? ""}, status = ${n.status} WHERE id = ${m[1]}`;
         return json({ ok: true });
       }
       if (m && method === "DELETE") { await sql`DELETE FROM coastal.cleans WHERE id = ${m[1]}`; return json({ ok: true }); }
 
+      if (path === "/api/admin/requests" && method === "GET")
+        return json(await sql`SELECT ${CLEAN_COLS} FROM coastal.cleans c WHERE c.status = 'requested' ORDER BY c.date, c.created_at`);
+
       if (path === "/api/admin/board" && method === "GET") {
         const from = url.searchParams.get("from") ?? "", to = url.searchParams.get("to") ?? "";
         if (!DATE_RE.test(from) || !DATE_RE.test(to)) return bad("from/to required (YYYY-MM-DD)");
         const cleans = await sql`SELECT ${CLEAN_COLS}, cl.name AS cleaner_name FROM coastal.cleans c LEFT JOIN coastal.cleaners cl ON cl.id = c.cleaner_id
-          WHERE c.date BETWEEN ${from} AND ${to} AND c.status != 'cancelled' ORDER BY c.date, c.start_time`;
+          WHERE c.date BETWEEN ${from} AND ${to} AND c.status NOT IN ('cancelled','requested','declined') ORDER BY c.date, c.start_time`;
         const availability = await sql`SELECT ${AVAIL_COLS}, cl.name FROM coastal.availability a JOIN coastal.cleaners cl ON cl.id = a.cleaner_id
           WHERE a.date BETWEEN ${from} AND ${to} AND cl.active ORDER BY cl.name`;
         return json({ cleans, availability });

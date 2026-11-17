@@ -50,7 +50,19 @@
   .modal > div { background:#fff; width:100%; max-width:520px; border-radius:16px 16px 0 0; padding:16px; max-height:85vh; overflow:auto; }
   .cand { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:10px 0; border-bottom:1px solid var(--line); }
   .cand .w { font-size:12px; color:var(--mute); } .cand .flag { color:var(--warn); font-size:12px; }
+  .mgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(110px,1fr)); gap:8px; margin:10px 0; }
+  .mi { position:relative; } .mi img, .mi video { width:100%; height:100px; object-fit:cover; border-radius:8px; background:#e8f0f1; display:block; }
+  .mi small { display:block; font-size:11px; color:var(--mute); } .mi .x { position:absolute; top:4px; right:4px; background:rgba(0,0,0,.6); color:#fff; border:0; border-radius:99px; width:22px; height:22px; line-height:20px; padding:0; }
+  .linkbox { background:#f1f7f8; border:1px solid var(--line); border-radius:8px; padding:8px; font-size:13px; word-break:break-all; margin:8px 0; }
   @media (min-width:700px){ .modal { align-items:center; } .modal > div { border-radius:16px; } }
+  .chat { max-height:42vh; overflow:auto; background:#f3f7f8; border-radius:10px; padding:8px; margin:8px 0; display:flex; flex-direction:column; gap:6px; }
+  .msg { max-width:85%; align-self:flex-start; } .msg.me { align-self:flex-end; }
+  .msg .b { background:#fff; border:1px solid var(--line); border-radius:12px; padding:7px 10px; white-space:pre-wrap; word-break:break-word; }
+  .msg.me .b { background:var(--teal); color:#fff; border-color:var(--teal); }
+  .msg small { display:block; color:var(--mute); font-size:11px; margin:2px 4px; } .msg.me small { text-align:right; }
+  .feepill { display:inline-block; margin-top:4px; padding:2px 8px; border-radius:10px; font-size:12px; font-weight:600; background:#fff3e0; color:var(--warn); }
+  .feepill.approved { background:#e3f5ea; color:var(--ok); } .feepill.declined { background:#fbe9e7; color:var(--bad); }
+  .badge { background:var(--bad); color:#fff; border-radius:10px; padding:0 6px; font-size:12px; margin-left:4px; }
 </style>
 </head>
 <body>
@@ -123,7 +135,8 @@ async function loginView() {
 async function cleanerView() {
   const today = new Date(); today.setHours(0,0,0,0);
   const days = Array.from({ length: 28 }, (_, i) => addDays(today, i));
-  const [avail, cleans] = await Promise.all([api('/api/me/availability'), api('/api/me/cleans')]);
+  const [avail, cleans] = await Promise.all([api('/api/me/availability'), api('/api/me/cleans?from=' + iso(addDays(today, -7)))]);
+  const cmap = Object.fromEntries(cleans.map(c => [c.id, c]));
   const posted = new Map(avail.map(a => [a.date, a]));
   const picked = new Set();
 
@@ -143,8 +156,12 @@ async function cleanerView() {
     <div class="clean ${c.status}"><div class="t">${pretty(c.date)} · ${t12(c.start_time)} <span class="pill ${c.status}">${c.status}</span></div>
       <div class="m">${esc(c.client)} — ${esc(c.type)} (~${c.duration_hours}h)</div>
       <div class="m">${esc(c.address)}</div>${c.notes ? `<div class="m">📝 ${esc(c.notes)}</div>` : ''}
-      ${c.status === 'assigned' ? `<div class="actions"><button class="btn sm" data-confirm="${c.id}">Confirm I'll be there</button></div>` : ''}
+      <div class="actions">${c.status === 'assigned' ? `<button class="btn sm" data-confirm="${c.id}">Confirm I'll be there</button>` : ''}
+        <button class="btn sm sec" data-media="${c.id}">📷 Photos &amp; video</button>
+        <button class="btn sm sec" data-msg="${c.id}">💬 Messages${c.unread ? `<span class="badge">${c.unread}</span>` : ''}</button></div>
     </div>`).join('') : '<div class="empty">No cleans assigned to you yet.</div>';
+  $('#mine').querySelectorAll('[data-media]').forEach(b => b.onclick = () => cleanerMediaModal(cmap[b.dataset.media]));
+  $('#mine').querySelectorAll('[data-msg]').forEach(b => b.onclick = () => chatModal(cmap[b.dataset.msg], 'cleaner'));
   $('#mine').querySelectorAll('[data-confirm]').forEach(b => b.onclick = async () => { await api(`/api/me/cleans/${b.dataset.confirm}/confirm`, { method:'POST' }); cleanerView(); });
 
   $('#posted').innerHTML = avail.length ? avail.map(a => `
@@ -203,6 +220,9 @@ async function boardView() {
         <div class="actions">
           ${c.cleaner_id ? `<button class="btn sm sec" data-un="${c.id}">Unassign</button>` : `<button class="btn sm" data-as="${c.id}">Assign</button>`}
           <button class="btn sm sec" data-ed="${c.id}">Edit</button>
+          ${c.cleaner_id ? `<button class="btn sm sec" data-mc="${c.id}">💬 Crew${c.unread_crew ? `<span class="badge">${c.unread_crew}</span>` : ''}</button>` : ''}
+          <button class="btn sm sec" data-mo="${c.id}">💬 Owner${c.unread_client ? `<span class="badge">${c.unread_client}</span>` : ''}</button>
+          ${['assigned','confirmed','done'].includes(c.status) ? `<button class="btn sm sec" data-md="${c.id}">📷 Media / report${c.report_published ? ' ✓' : ''}</button>` : ''}
           ${c.status === 'confirmed' || c.status === 'assigned' ? `<button class="btn sm sec" data-done="${c.id}">Mark done</button>` : ''}
           <button class="btn sm danger" data-cx="${c.id}">Cancel</button>
         </div></div>`).join('') || '<div class="empty">No cleans</div>'}
@@ -218,6 +238,9 @@ async function boardView() {
   on('data-ed', id => cleanForm(byId[id]));
   on('data-ap', async id => { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'open' } }); boardView(); });
   on('data-dc', async id => { if (confirm('Decline this request?')) { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'declined' } }); boardView(); } });
+  on('data-md', id => adminMediaModal(byId[id]));
+  on('data-mc', id => chatModal(byId[id], 'admin', 'crew'));
+  on('data-mo', id => chatModal(byId[id], 'admin', 'client'));
   on('data-un', async id => { await api(`/api/admin/cleans/${id}/unassign`, { method:'POST' }); boardView(); });
   on('data-done', async id => { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'done' } }); boardView(); });
   on('data-cx', async id => { if (confirm('Cancel this clean?')) { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'cancelled' } }); boardView(); } });
@@ -237,13 +260,15 @@ function cleanForm(c) {
       <div><label>Type</label><select id="f_type">${['Airbnb turnover','Residential','Commercial','Carpet','Tile/grout','Upholstery','Deep clean','Other'].map(t => `<option ${t === v.type ? 'selected' : ''}>${t}</option>`).join('')}</select></div></div>
     <label>Client / property</label><input id="f_client" value="${esc(v.client)}">
     <label>Address</label><input id="f_addr" value="${esc(v.address)}">
+    <div class="row"><div><label>Client phone (for reports)</label><input id="f_cphone" type="tel" value="${esc(v.contact_phone || '')}"></div>
+      <div><label>Client email (for reports)</label><input id="f_cemail" type="email" value="${esc(v.contact_email || '')}"></div></div>
     <label>Notes (door codes, restock list…)</label><textarea id="f_notes" rows="2">${esc(v.notes)}</textarea>
     <div class="err" id="f_err"></div>
     <div class="actions"><button class="btn" id="f_save">Save</button><button class="btn sec" id="f_x">Close</button></div>`);
   $('#f_x', m).onclick = () => m.remove();
   $('#f_save', m).onclick = async () => {
     const body = { date: $('#f_date', m).value, start_time: $('#f_st', m).value, duration_hours: +$('#f_dur', m).value, type: $('#f_type', m).value,
-      client: $('#f_client', m).value.trim(), address: $('#f_addr', m).value.trim(), notes: $('#f_notes', m).value.trim() };
+      client: $('#f_client', m).value.trim(), contact_phone: $('#f_cphone', m).value.trim() || null, contact_email: $('#f_cemail', m).value.trim() || null, address: $('#f_addr', m).value.trim(), notes: $('#f_notes', m).value.trim() };
     try { await api(c ? `/api/admin/cleans/${c.id}` : '/api/admin/cleans', { method: c ? 'PATCH' : 'POST', body }); m.remove(); weekStart = mondayOf(parse(body.date)); boardView(); }
     catch (e) { $('#f_err', m).textContent = e.message; }
   };
@@ -282,6 +307,165 @@ async function cleanersView() {
   document.querySelectorAll('[data-pin]').forEach(b => b.onclick = async () => { const pin = prompt('New PIN (4-8 digits)'); if (!pin) return;
     try { await api('/api/admin/cleaners/' + b.dataset.pin, { method:'PATCH', body:{ pin } }); cleanersView(); } catch (e) { alert(e.message); } });
   document.querySelectorAll('[data-act]').forEach(b => b.onclick = async () => { await api('/api/admin/cleaners/' + b.dataset.act, { method:'PATCH', body:{ active: +b.dataset.v } }); cleanersView(); });
+}
+
+// ---------------- media (photos & video) ----------------
+const MAX_BYTES = 50 * 1024 * 1024;
+const EXT_TYPES = { jpg:'image/jpeg', jpeg:'image/jpeg', png:'image/png', webp:'image/webp', heic:'image/heic', heif:'image/heif', mp4:'video/mp4', mov:'video/quicktime', webm:'video/webm' };
+const KIND_LABEL = { before:'Before', after:'After', other:'Other' };
+
+async function prepFile(file) {
+  let type = file.type || EXT_TYPES[(file.name.split('.').pop() || '').toLowerCase()] || '';
+  if (type.startsWith('image/') && !/heic|heif/.test(type)) {
+    try { // shrink big phone photos so uploads are fast; keep original if it can't be decoded
+      const bmp = await createImageBitmap(file);
+      const sc = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+      const cv = document.createElement('canvas'); cv.width = Math.round(bmp.width * sc); cv.height = Math.round(bmp.height * sc);
+      cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
+      const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.85));
+      if (blob && blob.size < file.size) return { blob, type: 'image/jpeg' };
+    } catch (e) { /* fall through to original */ }
+  }
+  return { blob: new Blob([file], { type }), type };
+}
+
+async function uploadOne(cleanId, kind, file) {
+  const { blob, type } = await prepFile(file);
+  if (!type) throw new Error(`${file.name}: unsupported file type`);
+  if (blob.size > MAX_BYTES) throw new Error(`${file.name} is over 50 MB. Record a shorter clip (30-60 sec).`);
+  const sign = await api(`/api/me/cleans/${cleanId}/media/sign`, { method:'POST', body:{ content_type: type, kind } });
+  const fd = new FormData(); fd.append('cacheControl', '3600'); fd.append('', blob);
+  const r = await fetch(sign.signed_url, { method:'PUT', body: fd, headers: { 'x-upsert': 'false' } });
+  if (!r.ok) throw new Error(`Upload failed for ${file.name} (${r.status})`);
+  await api(`/api/me/cleans/${cleanId}/media`, { method:'POST', body:{ path: sign.path, kind, content_type: type, size: blob.size } });
+}
+
+function gridHtml(items, deletable) {
+  if (!items.length) return '<div class="empty">No photos or video yet.</div>';
+  return `<div class="mgrid">${items.map(i => `<div class="mi">
+    ${i.url ? (i.type === 'video' ? `<video src="${esc(i.url)}" controls preload="metadata" playsinline></video>` : `<a href="${esc(i.url)}" target="_blank" rel="noopener"><img src="${esc(i.url)}" loading="lazy" alt=""></a>`) : '<div class="empty">unavailable</div>'}
+    <small>${KIND_LABEL[i.kind]}${i.type === 'video' ? ' · video' : ''}</small>
+    ${deletable ? `<button class="x" data-del="${i.id}" title="Remove">×</button>` : ''}</div>`).join('')}</div>`;
+}
+
+async function cleanerMediaModal(c) {
+  const m = modal(`<h2>Photos &amp; video</h2><div class="m" style="color:var(--mute)">${esc(c.client)} · ${pretty(c.date)}</div>
+    <label>These are…</label>
+    <select id="mk"><option value="before">Before photos / video</option><option value="after">After photos / video</option><option value="other">Other (damage, low supplies, notes)</option></select>
+    <label>Choose photos or a short video (max 50 MB each)</label>
+    <input type="file" id="mf" accept="image/*,video/*" multiple>
+    <div class="err" id="mstat"></div><div id="mgrid"></div>
+    <div class="actions"><button class="btn sec" id="mx">Done</button></div>`);
+  const refresh = async () => {
+    const items = await api(`/api/me/cleans/${c.id}/media`);
+    $('#mgrid', m).innerHTML = gridHtml(items, true);
+    m.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+      if (!confirm('Remove this file?')) return;
+      await api('/api/me/media/' + b.dataset.del, { method:'DELETE' }); refresh(); });
+  };
+  $('#mx', m).onclick = () => m.remove();
+  $('#mf', m).onchange = async e => {
+    const files = [...e.target.files]; const stat = $('#mstat', m); const errs = [];
+    for (let i = 0; i < files.length; i++) {
+      stat.style.color = 'var(--mute)'; stat.textContent = `Uploading ${i + 1} of ${files.length}…`;
+      try { await uploadOne(c.id, $('#mk', m).value, files[i]); } catch (err) { errs.push(err.message); }
+    }
+    e.target.value = '';
+    stat.style.color = errs.length ? 'var(--bad)' : 'var(--ok)';
+    stat.textContent = errs.length ? errs.join(' | ') : `Uploaded ${files.length} file${files.length === 1 ? '' : 's'} ✓`;
+    refresh();
+  };
+  refresh();
+}
+
+async function adminMediaModal(c) {
+  const d = await api(`/api/admin/cleans/${c.id}/media`);
+  const link = new URL('report.html?t=' + d.report.token, location.href).href;
+  const m = modal(`<h2>Media &amp; client report</h2><div class="m" style="color:var(--mute)">${esc(c.client)} · ${pretty(c.date)}</div>
+    <div id="mgrid">${gridHtml(d.media, true)}</div>
+    <label>Message to include for the client (optional)</label>
+    <textarea id="rnote" rows="2" placeholder="e.g. Restocked towels and soap. Noticed a small stain on the guest bedroom rug.">${esc(d.report.note)}</textarea>
+    <div id="rstate"></div><div class="err" id="rerr"></div>
+    <div class="actions"><button class="btn sec" id="rx">Close</button></div>`);
+  const drawState = (published) => {
+    $('#rstate', m).innerHTML = published ? `<div class="linkbox">${esc(link)}</div>
+      <div class="actions"><button class="btn sm" id="r_mail">✉ Email client</button><button class="btn sm" id="r_sms">💬 Text client</button>
+      <button class="btn sm sec" id="r_copy">Copy link</button><button class="btn sm sec" id="r_save">Save note</button><button class="btn sm danger" id="r_off">Unpublish</button></div>`
+      : `<div class="actions"><button class="btn" id="r_pub">Publish report (makes link live)</button></div>
+         <div class="m" style="color:var(--mute);font-size:13px;margin-top:6px">Nothing is visible to the client until you publish.</div>`;
+    const setPub = async (publish) => { try { await api(`/api/admin/cleans/${c.id}/report`, { method:'POST', body:{ publish, note: $('#rnote', m).value } }); drawState(publish); boardView(); } catch (e) { $('#rerr', m).textContent = e.message; } };
+    if (published) {
+      const who = c.contact_name || c.client;
+      const msg = () => `Hi ${who}, your ${c.type} at ${c.address || 'your property'} on ${pretty(c.date)} is complete. Here are the before and after photos and video:\n\n${link}\n\n${$('#rnote', m).value ? $('#rnote', m).value + '\n\n' : ''}Thank you for choosing Coastal Cleaning PSL!`;
+      $('#r_mail', m).onclick = () => { location.href = `mailto:${encodeURIComponent(c.contact_email || '')}?subject=${encodeURIComponent('Your cleaning report - ' + pretty(c.date))}&body=${encodeURIComponent(msg())}`; };
+      $('#r_sms', m).onclick = () => { location.href = `sms:${(c.contact_phone || '').replace(/[^\d+]/g, '')}?&body=${encodeURIComponent(msg())}`; };
+      $('#r_copy', m).onclick = async () => { try { await navigator.clipboard.writeText(link); $('#rerr', m).style.color = 'var(--ok)'; $('#rerr', m).textContent = 'Link copied ✓'; } catch { $('#rerr', m).textContent = 'Copy failed. Select the link above.'; } };
+      $('#r_save', m).onclick = () => setPub(true);
+      $('#r_off', m).onclick = () => setPub(false);
+    } else { $('#r_pub', m).onclick = () => { if (!d.media.length && !confirm('There are no photos or video yet. Publish anyway?')) return; setPub(true); }; }
+  };
+  drawState(d.report.published);
+  $('#rx', m).onclick = () => m.remove();
+  m.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
+    if (!confirm('Remove this file?')) return;
+    await api('/api/admin/media/' + b.dataset.del, { method:'DELETE' }); m.remove(); adminMediaModal(c); });
+}
+
+// ---------------- messaging ----------------
+const fmtTime = ts => new Date(ts).toLocaleString(undefined, { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' });
+function threadHtml(msgs, me, who) {
+  if (!msgs.length) return '<div class="empty">No messages yet.</div>';
+  return msgs.map(x => `<div class="msg ${x.sender === me ? 'me' : ''}"><div class="b">${esc(x.body)}${x.fee_cents ? `<br><span class="feepill ${x.fee_status}">Additional fee $${(x.fee_cents/100).toFixed(2)} · ${x.fee_status}</span>` : ''}</div>
+    <small>${x.sender === me ? 'You' : esc(who[x.sender] || x.sender)} · ${fmtTime(x.created_at)}</small></div>`).join('');
+}
+// viewer: 'cleaner' or 'admin'. For admin, thread is 'crew' (with the cleaner) or 'client' (with the owner).
+async function chatModal(c, viewer, thread = 'crew') {
+  const base = viewer === 'cleaner' ? `/api/me/cleans/${c.id}/messages` : `/api/admin/cleans/${c.id}/messages`;
+  const getUrl = viewer === 'cleaner' ? base : `${base}?thread=${thread}`;
+  const isOwner = viewer === 'admin' && thread === 'client';
+  const who = viewer === 'cleaner' ? { admin: 'Nicole' } : thread === 'crew' ? { cleaner: c.cleaner_name || 'Cleaner' } : { client: c.contact_name || 'Owner' };
+  let link = '';
+  if (isOwner) { const d = await api(`/api/admin/cleans/${c.id}/media`); link = new URL('report.html?t=' + d.report.token, location.href).href; }
+  const title = viewer === 'cleaner' ? 'Messages with Nicole' : thread === 'crew' ? `Crew chat · ${esc(c.cleaner_name || '')}` : 'Text the owner';
+  const m = modal(`<h2>${title}</h2><div class="m" style="color:var(--mute)">${esc(c.client)} · ${pretty(c.date)}</div>
+    <div class="chat" id="chat"></div>
+    <textarea id="cb" rows="2" placeholder="Type a message…"></textarea>
+    ${isOwner ? `<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--teal);font-weight:600">＋ Request an additional fee</summary>
+      <label>Amount ($)</label><input id="cfee" type="number" min="0.01" step="0.01" placeholder="e.g. 45.00"><div class="m" style="color:var(--mute);font-size:13px">Your message above is shown with the fee; the owner can Approve or Decline on their link.</div></details>` : ''}
+    <div class="err" id="cerr"></div>
+    <div class="actions"><button class="btn" id="cs">Send</button>
+      ${isOwner ? `<button class="btn sm sec" id="c_sms">💬 Text link to owner</button><button class="btn sm sec" id="c_mail">✉ Email link</button><button class="btn sm sec" id="c_copy">Copy link</button>` : ''}
+      <button class="btn sec" id="cx">Close</button></div>
+    ${isOwner ? `<div class="m" style="color:var(--mute);font-size:12px;margin-top:6px">The owner replies on their private link (no login). Send them the link once, then use "Text link" again whenever you want to nudge them.</div>` : ''}`);
+  const box = $('#chat', m);
+  let last = -1, closed = false;
+  const load = async () => {
+    try {
+      const msgs = await api(getUrl);
+      const sig = msgs.length + ':' + msgs.map(x => x.fee_status || '').join('');
+      if (sig === last) return; last = sig;
+      box.innerHTML = threadHtml(msgs, viewer, who); box.scrollTop = box.scrollHeight;
+    } catch (e) { if (!closed) $('#cerr', m).textContent = e.message; }
+  };
+  const poll = setInterval(() => { if (!document.body.contains(m)) { clearInterval(poll); closed = true; return; } load(); }, 15000);
+  const close = () => { clearInterval(poll); closed = true; m.remove(); if (viewer === 'cleaner') cleanerView(); else boardView(); };
+  m.onclick = e => { if (e.target === m) close(); };
+  $('#cx', m).onclick = close;
+  $('#cs', m).onclick = async () => {
+    const body = $('#cb', m).value.trim(); if (!body) return;
+    const payload = viewer === 'cleaner' ? { body } : { thread, body };
+    const fee = isOwner ? $('#cfee', m).value : '';
+    if (fee) payload.fee_dollars = fee;
+    try { $('#cerr', m).textContent = ''; await api(base, { method:'POST', body: payload }); $('#cb', m).value = ''; if (isOwner) $('#cfee', m).value = ''; last = -1; load(); }
+    catch (e) { $('#cerr', m).textContent = e.message; }
+  };
+  if (isOwner) {
+    const text = `Coastal Cleaning PSL - message about your ${c.type} on ${pretty(c.date)}: ${link}`;
+    $('#c_sms', m).onclick = () => { location.href = `sms:${(c.contact_phone || '').replace(/[^\d+]/g, '')}?&body=${encodeURIComponent(text)}`; };
+    $('#c_mail', m).onclick = () => { location.href = `mailto:${encodeURIComponent(c.contact_email || '')}?subject=${encodeURIComponent('Coastal Cleaning PSL - ' + pretty(c.date))}&body=${encodeURIComponent(text)}`; };
+    $('#c_copy', m).onclick = async () => { try { await navigator.clipboard.writeText(link); $('#cerr', m).style.color = 'var(--ok)'; $('#cerr', m).textContent = 'Link copied ✓'; } catch { $('#cerr', m).textContent = 'Copy failed.'; } };
+  }
+  load();
 }
 
 render();

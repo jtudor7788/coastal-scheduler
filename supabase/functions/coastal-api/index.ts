@@ -2,10 +2,19 @@
 // Auth is handled here (admin password / cleaner PIN -> signed token), so deploy with verify_jwt = false.
 // Required secrets: COASTAL_ADMIN_PASSWORD, COASTAL_SESSION_SECRET. SUPABASE_DB_URL is provided automatically.
 import postgres from "npm:postgres@3.4.5";
+import { createClient } from "npm:@supabase/supabase-js@2";
 
 const ADMIN_PASSWORD = Deno.env.get("COASTAL_ADMIN_PASSWORD") ?? "";
 const SECRET = Deno.env.get("COASTAL_SESSION_SECRET") ?? "";
 const sql = postgres(Deno.env.get("SUPABASE_DB_URL")!, { prepare: false, max: 3 });
+
+const supa = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
+const BUCKET = "clean-media";
+const MEDIA_TYPES: Record<string, string> = {
+  "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/heic": "heic", "image/heif": "heif",
+  "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
+};
+const MEDIA_PATH_RE = /^\d+\/[0-9a-f-]{36}\.[a-z0-9]{3,4}$/;
 
 const CORS = {
   "Access-Control-Allow-Origin": Deno.env.get("COASTAL_ALLOWED_ORIGIN") ?? "*",
@@ -52,13 +61,44 @@ function safeEq(a: string, b: string) {
 // ---- login throttle (per instance, best effort) ----
 const fails = new Map<string, { n: number; t: number }>();
 const reqHits = new Map<string, number[]>();
+const msgHits = new Map<string, number[]>();
 const throttled = (k: string) => { const f = fails.get(k); return !!f && f.n >= 8 && Date.now() - f.t < 600_000; };
 const noteFail = (k: string) => { const f = fails.get(k) ?? { n: 0, t: 0 }; fails.set(k, { n: f.n + 1, t: Date.now() }); };
 
 // ---- column fragments ----
 const CLEAN_COLS = sql`c.id, c.date::text AS date, to_char(c.start_time,'HH24:MI') AS start_time, c.duration_hours::float AS duration_hours,
-  c.client, c.address, c.type, c.notes, c.status, c.cleaner_id, c.contact_name, c.contact_phone, c.contact_email, c.source`;
+  c.client, c.address, c.type, c.notes, c.status, c.cleaner_id, c.contact_name, c.contact_phone, c.contact_email, c.source, c.report_published`;
 const AVAIL_COLS = sql`a.id, a.cleaner_id, a.date::text AS date, to_char(a.start_time,'HH24:MI') AS start_time, to_char(a.end_time,'HH24:MI') AS end_time, a.note`;
+
+async function mediaFor(cleanId: number) {
+  const rows = await sql`SELECT id, kind, path, content_type, size_bytes, caption FROM coastal.clean_media WHERE clean_id = ${cleanId} ORDER BY kind, id`;
+  if (!rows.length) return [];
+  const { data } = await supa.storage.from(BUCKET).createSignedUrls(rows.map((r: any) => r.path), 3600);
+  const urlBy = new Map((data ?? []).map((d: any) => [d.path, d.signedUrl]));
+  return rows.map((r: any) => ({
+    id: Number(r.id), kind: r.kind, type: String(r.content_type).startsWith("video") ? "video" : "image",
+    url: urlBy.get(r.path) ?? null, caption: r.caption ?? "", size_bytes: r.size_bytes ? Number(r.size_bytes) : null,
+  }));
+}
+const ownClean = async (cleanId: string, me: number) =>
+  (await sql`SELECT id FROM coastal.cleans WHERE id = ${cleanId} AND cleaner_id = ${me} AND status IN ('assigned','confirmed','done')`)[0];
+
+type Viewer = "admin" | "cleaner" | "client";
+async function threadFor(cleanId: number | string, thread: string, viewer: Viewer) {
+  // Reading a thread marks the other side's messages as seen.
+  await sql`UPDATE coastal.clean_messages SET seen = true WHERE clean_id = ${cleanId} AND thread = ${thread} AND sender != ${viewer} AND NOT seen`;
+  return await sql`SELECT id, thread, sender, body, fee_cents, fee_status, created_at FROM coastal.clean_messages
+    WHERE clean_id = ${cleanId} AND thread = ${thread} ORDER BY id`;
+}
+const clipText = (v: unknown, n: number) => String(v ?? "").trim().slice(0, n);
+// Client link works once the report is published, or once Nicole has messaged the owner about this clean.
+async function clientClean(t: string) {
+  if (!/^[a-f0-9]{64}$/.test(t)) return null;
+  const [c] = await sql`SELECT c.id, c.date::text AS date, c.type, c.report_note, c.report_published,
+    EXISTS (SELECT 1 FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'client' AND mm.sender = 'admin') AS has_msg
+    FROM coastal.cleans c WHERE c.report_token = ${t}`;
+  return c && (c.report_published || c.has_msg) ? c : null;
+}
 
 async function candidatesFor(clean: any) {
   const avail = await sql`SELECT ${AVAIL_COLS}, cl.name FROM coastal.availability a JOIN coastal.cleaners cl ON cl.id = a.cleaner_id
@@ -98,6 +138,40 @@ Deno.serve(async (req) => {
     if (path === "/api/health") return json({ ok: true });
     if (path === "/api/cleaners/public" && method === "GET")
       return json(await sql`SELECT id, name FROM coastal.cleaners WHERE active ORDER BY name`);
+
+    if (path === "/api/public/report" && method === "GET") {
+      const c = await clientClean(url.searchParams.get("t") ?? "");
+      if (!c) return bad("Report not found", 404);
+      return json({ date: c.date, type: c.type, published: c.report_published, note: c.report_published ? (c.report_note ?? "") : "",
+        media: c.report_published ? await mediaFor(Number(c.id)) : [] });
+    }
+    if (path === "/api/public/report/messages") {
+      const c = await clientClean(method === "GET" ? (url.searchParams.get("t") ?? "") : String(body.t ?? ""));
+      if (!c) return bad("Not found", 404);
+      if (method === "GET") return json(await threadFor(c.id, "client", "client"));
+      if (method === "POST") {
+        const text = clipText(body.body, 2000);
+        if (!text) return bad("Please type a message");
+        const k = "msg:" + ip, now = Date.now();
+        const hits = (msgHits.get(k) ?? []).filter((x) => now - x < 3600_000);
+        if (hits.length >= 20) return bad("Too many messages. Please call us instead.", 429);
+        hits.push(now); msgHits.set(k, hits);
+        await sql`INSERT INTO coastal.clean_messages (clean_id, thread, sender, body) VALUES (${c.id}, 'client', 'client', ${text})`;
+        return json({ ok: true });
+      }
+    }
+    if (path === "/api/public/report/fee" && method === "POST") {
+      const c = await clientClean(String(body.t ?? ""));
+      if (!c) return bad("Not found", 404);
+      const decision = body.decision === "approved" ? "approved" : body.decision === "declined" ? "declined" : null;
+      if (!decision) return bad("Bad decision");
+      const [f] = await sql`UPDATE coastal.clean_messages SET fee_status = ${decision}, seen = true
+        WHERE id = ${Number(body.message_id) || 0} AND clean_id = ${c.id} AND thread = 'client' AND fee_cents IS NOT NULL AND fee_status = 'pending' RETURNING fee_cents`;
+      if (!f) return bad("That request was already answered", 409);
+      await sql`INSERT INTO coastal.clean_messages (clean_id, thread, sender, body)
+        VALUES (${c.id}, 'client', 'client', ${(decision === "approved" ? "Approved" : "Declined") + " the additional fee of $" + (Number(f.fee_cents) / 100).toFixed(2)})`;
+      return json({ ok: true });
+    }
 
     if (path === "/api/public/request" && method === "POST") {
       // Public client intake. Lands as status 'requested'; Nicole must approve before cleaners can see it.
@@ -174,8 +248,57 @@ Deno.serve(async (req) => {
       }
       if (path === "/api/me/cleans" && method === "GET") {
         const from = url.searchParams.get("from") || today();
-        return json(await sql`SELECT ${CLEAN_COLS} FROM coastal.cleans c WHERE c.cleaner_id = ${me} AND c.date >= ${from}
+        return json(await sql`SELECT ${CLEAN_COLS},
+          (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'crew' AND mm.sender = 'admin' AND NOT mm.seen)::int AS unread
+          FROM coastal.cleans c WHERE c.cleaner_id = ${me} AND c.date >= ${from}
           AND c.status != 'cancelled' ORDER BY c.date, c.start_time`);
+      }
+      m = path.match(/^\/api\/me\/cleans\/(\d+)\/media\/sign$/);
+      if (m && method === "POST") {
+        if (!(await ownClean(m[1], me))) return bad("Not your clean", 404);
+        const ext = MEDIA_TYPES[body.content_type];
+        if (!ext) return bad("Unsupported file type. Use JPG, PNG, HEIC photos or MP4/MOV video.");
+        if (!["before", "after", "other"].includes(body.kind)) return bad("Bad kind");
+        const [{ n }] = await sql`SELECT count(*)::int AS n FROM coastal.clean_media WHERE clean_id = ${m[1]}`;
+        if (n >= 80) return bad("Too many files on this clean");
+        const filePath = `${m[1]}/${crypto.randomUUID()}.${ext}`;
+        const { data, error } = await supa.storage.from(BUCKET).createSignedUploadUrl(filePath);
+        if (error || !data) { console.error(error); return bad("Could not start upload", 500); }
+        return json({ path: filePath, signed_url: data.signedUrl });
+      }
+      m = path.match(/^\/api\/me\/cleans\/(\d+)\/media$/);
+      if (m && method === "POST") {
+        if (!(await ownClean(m[1], me))) return bad("Not your clean", 404);
+        if (!MEDIA_PATH_RE.test(body.path || "") || !String(body.path).startsWith(m[1] + "/")) return bad("Bad file path");
+        if (!MEDIA_TYPES[body.content_type] || !["before", "after", "other"].includes(body.kind)) return bad("Bad file info");
+        const { data: sd, error: se } = await supa.storage.from(BUCKET).createSignedUrl(body.path, 60);
+        if (se || !sd) return bad("That file did not finish uploading. Please try again.");
+        const [r] = await sql`INSERT INTO coastal.clean_media (clean_id, kind, path, content_type, size_bytes, caption, uploaded_by)
+          VALUES (${m[1]}, ${body.kind}, ${body.path}, ${body.content_type}, ${Number(body.size) || null}, ${String(body.caption ?? "").slice(0, 200)}, ${me}) RETURNING id`;
+        return json({ id: Number(r.id) });
+      }
+      if (m && method === "GET") {
+        if (!(await ownClean(m[1], me))) return bad("Not your clean", 404);
+        return json(await mediaFor(Number(m[1])));
+      }
+      m = path.match(/^\/api\/me\/media\/(\d+)$/);
+      if (m && method === "DELETE") {
+        const [row] = await sql`SELECT mm.id, mm.path FROM coastal.clean_media mm JOIN coastal.cleans c ON c.id = mm.clean_id WHERE mm.id = ${m[1]} AND c.cleaner_id = ${me}`;
+        if (!row) return bad("Not found", 404);
+        await supa.storage.from(BUCKET).remove([row.path]);
+        await sql`DELETE FROM coastal.clean_media WHERE id = ${m[1]}`;
+        return json({ ok: true });
+      }
+      m = path.match(/^\/api\/me\/cleans\/(\d+)\/messages$/);
+      if (m) {
+        if (!(await ownClean(m[1], me))) return bad("Not your clean", 404);
+        if (method === "GET") return json(await threadFor(m[1], "crew", "cleaner"));
+        if (method === "POST") {
+          const text = clipText(body.body, 2000);
+          if (!text) return bad("Please type a message");
+          await sql`INSERT INTO coastal.clean_messages (clean_id, thread, sender, body) VALUES (${m[1]}, 'crew', 'cleaner', ${text})`;
+          return json({ ok: true });
+        }
       }
       m = path.match(/^\/api\/me\/cleans\/(\d+)\/confirm$/);
       if (m && method === "POST") {
@@ -210,8 +333,8 @@ Deno.serve(async (req) => {
         const b = { start_time: "10:00", duration_hours: 2, type: "Airbnb turnover", ...body };
         const err = validateClean(b);
         if (err) return bad(err);
-        const [r] = await sql`INSERT INTO coastal.cleans (date, start_time, duration_hours, client, address, type, notes)
-          VALUES (${b.date}, ${b.start_time}, ${b.duration_hours}, ${b.client}, ${b.address ?? ""}, ${b.type}, ${b.notes ?? ""}) RETURNING id`;
+        const [r] = await sql`INSERT INTO coastal.cleans (date, start_time, duration_hours, client, address, type, notes, contact_name, contact_phone, contact_email)
+          VALUES (${b.date}, ${b.start_time}, ${b.duration_hours}, ${b.client}, ${b.address ?? ""}, ${b.type}, ${b.notes ?? ""}, ${b.contact_name ?? null}, ${b.contact_phone ?? null}, ${b.contact_email ?? null}) RETURNING id`;
         return json({ id: Number(r.id) });
       }
       m = path.match(/^\/api\/admin\/cleans\/(\d+)$/);
@@ -223,10 +346,54 @@ Deno.serve(async (req) => {
         if (err) return bad(err);
         if (!["requested", "declined", "open", "assigned", "confirmed", "done", "cancelled"].includes(n.status)) return bad("Bad status");
         await sql`UPDATE coastal.cleans SET date = ${n.date}, start_time = ${n.start_time}, duration_hours = ${n.duration_hours},
-          client = ${n.client}, address = ${n.address ?? ""}, type = ${n.type}, notes = ${n.notes ?? ""}, status = ${n.status} WHERE id = ${m[1]}`;
+          client = ${n.client}, address = ${n.address ?? ""}, type = ${n.type}, notes = ${n.notes ?? ""}, status = ${n.status},
+          contact_name = ${n.contact_name ?? null}, contact_phone = ${n.contact_phone ?? null}, contact_email = ${n.contact_email ?? null} WHERE id = ${m[1]}`;
         return json({ ok: true });
       }
       if (m && method === "DELETE") { await sql`DELETE FROM coastal.cleans WHERE id = ${m[1]}`; return json({ ok: true }); }
+
+      m = path.match(/^\/api\/admin\/cleans\/(\d+)\/media$/);
+      if (m && method === "GET") {
+        const [c] = await sql`SELECT report_token, report_published, report_note FROM coastal.cleans WHERE id = ${m[1]}`;
+        if (!c) return bad("Not found", 404);
+        return json({ media: await mediaFor(Number(m[1])), report: { token: c.report_token, published: c.report_published, note: c.report_note ?? "" } });
+      }
+      m = path.match(/^\/api\/admin\/cleans\/(\d+)\/report$/);
+      if (m && method === "POST") {
+        const note = String(body.note ?? "").slice(0, 2000);
+        const [c] = await sql`UPDATE coastal.cleans SET report_published = ${!!body.publish}, report_note = ${note} WHERE id = ${m[1]} RETURNING report_token, report_published`;
+        if (!c) return bad("Not found", 404);
+        return json({ token: c.report_token, published: c.report_published });
+      }
+      m = path.match(/^\/api\/admin\/cleans\/(\d+)\/messages$/);
+      if (m) {
+        const thread = method === "GET" ? (url.searchParams.get("thread") ?? "") : String(body.thread ?? "");
+        if (!["crew", "client"].includes(thread)) return bad("Bad thread");
+        const [exists] = await sql`SELECT 1 FROM coastal.cleans WHERE id = ${m[1]}`;
+        if (!exists) return bad("Not found", 404);
+        if (method === "GET") return json(await threadFor(m[1], thread, "admin"));
+        if (method === "POST") {
+          const text = clipText(body.body, 2000);
+          if (!text) return bad("Please type a message");
+          let feeCents: number | null = null;
+          if (body.fee_dollars != null && body.fee_dollars !== "") {
+            if (thread !== "client") return bad("Fees can only be requested from the owner");
+            feeCents = Math.round(Number(body.fee_dollars) * 100);
+            if (!Number.isFinite(feeCents) || feeCents < 1 || feeCents > 1000000) return bad("Enter a fee between $0.01 and $10,000");
+          }
+          await sql`INSERT INTO coastal.clean_messages (clean_id, thread, sender, body, fee_cents, fee_status)
+            VALUES (${m[1]}, ${thread}, 'admin', ${text}, ${feeCents}, ${feeCents ? "pending" : null})`;
+          return json({ ok: true });
+        }
+      }
+      m = path.match(/^\/api\/admin\/media\/(\d+)$/);
+      if (m && method === "DELETE") {
+        const [row] = await sql`SELECT path FROM coastal.clean_media WHERE id = ${m[1]}`;
+        if (!row) return bad("Not found", 404);
+        await supa.storage.from(BUCKET).remove([row.path]);
+        await sql`DELETE FROM coastal.clean_media WHERE id = ${m[1]}`;
+        return json({ ok: true });
+      }
 
       if (path === "/api/admin/requests" && method === "GET")
         return json(await sql`SELECT ${CLEAN_COLS} FROM coastal.cleans c WHERE c.status = 'requested' ORDER BY c.date, c.created_at`);
@@ -234,7 +401,10 @@ Deno.serve(async (req) => {
       if (path === "/api/admin/board" && method === "GET") {
         const from = url.searchParams.get("from") ?? "", to = url.searchParams.get("to") ?? "";
         if (!DATE_RE.test(from) || !DATE_RE.test(to)) return bad("from/to required (YYYY-MM-DD)");
-        const cleans = await sql`SELECT ${CLEAN_COLS}, cl.name AS cleaner_name FROM coastal.cleans c LEFT JOIN coastal.cleaners cl ON cl.id = c.cleaner_id
+        const cleans = await sql`SELECT ${CLEAN_COLS}, cl.name AS cleaner_name,
+          (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'crew' AND mm.sender = 'cleaner' AND NOT mm.seen)::int AS unread_crew,
+          (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'client' AND mm.sender = 'client' AND NOT mm.seen)::int AS unread_client
+          FROM coastal.cleans c LEFT JOIN coastal.cleaners cl ON cl.id = c.cleaner_id
           WHERE c.date BETWEEN ${from} AND ${to} AND c.status NOT IN ('cancelled','requested','declined') ORDER BY c.date, c.start_time`;
         const availability = await sql`SELECT ${AVAIL_COLS}, cl.name FROM coastal.availability a JOIN coastal.cleaners cl ON cl.id = a.cleaner_id
           WHERE a.date BETWEEN ${from} AND ${to} AND cl.active ORDER BY cl.name`;

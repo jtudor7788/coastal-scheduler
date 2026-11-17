@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Your Cleaning Report | Coastal Cleaning PSL</title>
+<style>
+  :root { --teal:#0e7c86; --bg:#f3f7f8; --ink:#17282b; --mute:#66797c; --line:#dbe5e7; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header { background:var(--teal); color:#fff; padding:18px 16px; text-align:center; }
+  header h1 { margin:0; font-size:21px; } header p { margin:4px 0 0; opacity:.9; font-size:14px; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:18px; margin-bottom:14px; }
+  h2 { margin:0 0 10px; font-size:18px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px; }
+  .grid img, .grid video { width:100%; border-radius:10px; background:#e8f0f1; display:block; max-height:360px; object-fit:cover; }
+  .note { white-space:pre-wrap; } .mute { color:var(--mute); font-size:14px; }
+  .err { text-align:center; padding:40px 10px; color:var(--mute); }
+  textarea { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font:inherit; }
+  button { font:inherit; cursor:pointer; border:0; border-radius:8px; padding:9px 16px; font-weight:600; background:var(--teal); color:#fff; }
+  button.no { background:#fbe9e7; color:#c0392b; } button.yes { background:#2e9d5b; }
+  .chat { max-height:50vh; overflow:auto; background:#f3f7f8; border-radius:10px; padding:8px; margin:8px 0; display:flex; flex-direction:column; gap:6px; }
+  .msg { max-width:85%; align-self:flex-start; } .msg.me { align-self:flex-end; }
+  .msg .b { background:#fff; border:1px solid var(--line); border-radius:12px; padding:7px 10px; white-space:pre-wrap; word-break:break-word; }
+  .msg.me .b { background:var(--teal); color:#fff; border-color:var(--teal); }
+  .msg small { display:block; color:var(--mute); font-size:11px; margin:2px 4px; } .msg.me small { text-align:right; }
+  .fee { margin-top:6px; padding:8px; border-radius:8px; background:#fff3e0; color:#7a4a10; font-size:14px; }
+  .fee.approved { background:#e3f5ea; color:#1d6b3d; } .fee.declined { background:#fbe9e7; color:#a03023; }
+  .fee .a { display:flex; gap:8px; margin-top:6px; }
+</style>
+</head>
+<body>
+<header><h1>🌊 Coastal Cleaning PSL</h1><p>Your cleaning report</p></header>
+<main id="app"><div class="err">Loading…</div></main>
+<script src="config.js"></script>
+<script>
+const API = (window.COASTAL_API_BASE || '').replace(/\/$/, '');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const t = new URLSearchParams(location.search).get('t') || '';
+(async () => {
+  const app = document.getElementById('app');
+  const fmt = ts => new Date(ts).toLocaleString(undefined, { month:'short', day:'numeric', hour:'numeric', minute:'2-digit' });
+  const j = async (path, opts) => { const r = await fetch(API + path, opts); const d = await r.json().catch(() => ({})); if (!r.ok) throw new Error(d.error || 'Something went wrong'); return d; };
+  let d;
+  try { d = await j(`/api/public/report?t=${encodeURIComponent(t)}`); }
+  catch (e) { app.innerHTML = '<div class="err">This link isn\'t available. Please contact Coastal Cleaning PSL.</div>'; return; }
+  const [y, mo, da] = d.date.split('-').map(Number);
+  const pretty = new Date(y, mo - 1, da).toLocaleDateString(undefined, { weekday:'long', month:'long', day:'numeric', year:'numeric' });
+  const groups = [['before','Before'],['after','After'],['other','Notes & extras']];
+  const media = i => i.url ? (i.type === 'video' ? `<video src="${esc(i.url)}" controls preload="metadata" playsinline></video>` : `<a href="${esc(i.url)}" target="_blank" rel="noopener"><img src="${esc(i.url)}" alt="${esc(i.kind)} photo" loading="lazy"></a>`) : '';
+  const top = d.published
+    ? `<div class="card"><h2>${esc(d.type)} complete ✓</h2><div class="mute">${esc(pretty)}</div>${d.note ? `<p class="note">${esc(d.note)}</p>` : ''}</div>` +
+      groups.map(([k, label]) => { const items = d.media.filter(i => i.kind === k); return items.length ? `<div class="card"><h2>${label}</h2><div class="grid">${items.map(media).join('')}</div></div>` : ''; }).join('') +
+      (d.media.length ? '<div class="mute" style="text-align:center;margin-bottom:14px">Tap a photo to view it full size. Links to photos and video expire after about an hour. Reload this page for fresh ones.</div>' : '')
+    : `<div class="card"><h2>${esc(d.type)}</h2><div class="mute">${esc(pretty)}</div></div>`;
+  app.innerHTML = top + `<div class="card"><h2>Messages with Coastal Cleaning</h2><div class="chat" id="chat"></div>
+    <textarea id="cb" rows="2" placeholder="Type a reply…"></textarea><div class="mute" id="cerr" style="margin:6px 0"></div><button id="cs">Send</button></div>`;
+  const box = document.getElementById('chat'); let sig = '';
+  const draw = msgs => {
+    box.innerHTML = msgs.length ? msgs.map(x => `<div class="msg ${x.sender === 'client' ? 'me' : ''}"><div class="b">${esc(x.body)}</div>
+      ${x.fee_cents ? `<div class="fee ${x.fee_status}"><b>Additional fee: $${(x.fee_cents/100).toFixed(2)}</b>${x.fee_status === 'pending' && x.sender === 'admin'
+        ? `<div class="a"><button class="yes" data-f="approved" data-id="${x.id}">Approve</button><button class="no" data-f="declined" data-id="${x.id}">Decline</button></div>` : ` · ${esc(x.fee_status)}`}</div>` : ''}
+      <small>${x.sender === 'client' ? 'You' : 'Coastal Cleaning'} · ${fmt(x.created_at)}</small></div>`).join('') : '<div class="mute" style="text-align:center">No messages yet.</div>';
+    box.scrollTop = box.scrollHeight;
+    box.querySelectorAll('[data-f]').forEach(b => b.addEventListener('click', async () => {
+      if (!confirm((b.dataset.f === 'approved' ? 'Approve' : 'Decline') + ' this additional fee?')) return;
+      try { await j('/api/public/report/fee', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ t, message_id: +b.dataset.id, decision: b.dataset.f }) }); sig = ''; load(); }
+      catch (e) { document.getElementById('cerr').textContent = e.message; }
+    }));
+  };
+  const load = async () => { try { const msgs = await j(`/api/public/report/messages?t=${encodeURIComponent(t)}`); const s = msgs.length + ':' + msgs.map(x => x.fee_status || '').join(''); if (s !== sig) { sig = s; draw(msgs); } } catch {} };
+  document.getElementById('cs').addEventListener('click', async () => {
+    const body = document.getElementById('cb').value.trim(); if (!body) return;
+    try { document.getElementById('cerr').textContent = ''; await j('/api/public/report/messages', { method:'POST', headers:{ 'Content-Type':'application/json' }, body: JSON.stringify({ t, body }) }); document.getElementById('cb').value = ''; sig = ''; load(); }
+    catch (e) { document.getElementById('cerr').textContent = e.message; }
+  });
+  load(); setInterval(load, 20000);
+})();
+</script>
+</body>
+</html>

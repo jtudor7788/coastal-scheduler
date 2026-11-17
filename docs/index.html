@@ -4,13 +4,20 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Coastal Cleaning Scheduler</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#0e7c86">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Coastal">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="icon-192.png">
 <style>
   :root { --teal:#0e7c86; --teal-d:#0a5d65; --bg:#f3f7f8; --card:#fff; --ink:#17282b; --mute:#66797c; --line:#dbe5e7; --ok:#2e9d5b; --warn:#d9822b; --bad:#c0392b; }
   * { box-sizing: border-box; }
   body { margin:0; font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
   header { background:var(--teal); color:#fff; padding:12px 16px; display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:5; }
   header h1 { font-size:18px; margin:0; }
-  header button { background:rgba(255,255,255,.18); color:#fff; border:0; padding:6px 12px; border-radius:8px; }
+  header button { margin-left:4px; background:rgba(255,255,255,.18); color:#fff; border:0; padding:6px 12px; border-radius:8px; }
   main { max-width:900px; margin:0 auto; padding:14px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-bottom:14px; }
   .card h2 { margin:0 0 10px; font-size:17px; }
@@ -63,10 +70,16 @@
   .feepill { display:inline-block; margin-top:4px; padding:2px 8px; border-radius:10px; font-size:12px; font-weight:600; background:#fff3e0; color:var(--warn); }
   .feepill.approved { background:#e3f5ea; color:var(--ok); } .feepill.declined { background:#fbe9e7; color:var(--bad); }
   .badge { background:var(--bad); color:#fff; border-radius:10px; padding:0 6px; font-size:12px; margin-left:4px; }
+  .access { background:#fff8e1; border:1px solid #f0d58a; border-radius:8px; padding:6px 8px; margin-top:4px; white-space:pre-wrap; font-size:14px; }
+  .warnbox { background:#fbe9e7; color:var(--bad); border-radius:8px; padding:6px 8px; margin-top:4px; font-size:14px; font-weight:600; }
+  .task { display:flex; gap:10px; align-items:center; padding:9px 4px; border-bottom:1px solid var(--line); }
+  .task input { width:22px; height:22px; flex:none; } .task.done span { color:var(--mute); text-decoration:line-through; }
+  .task button { margin-left:auto; background:none; border:0; color:var(--bad); font-size:20px; }
+  .hint { color:var(--mute); font-size:13px; }
 </style>
 </head>
 <body>
-<header><h1>🌊 Coastal Cleaning Scheduler</h1><button id="logout" hidden>Sign out</button></header>
+<header><h1>🌊 Coastal Cleaning Scheduler</h1><span><button id="install" hidden>📲 Install</button> <button id="logout" hidden>Sign out</button></span></header>
 <main id="app"></main>
 
 <script src="config.js"></script>
@@ -156,11 +169,24 @@ async function cleanerView() {
     <div class="clean ${c.status}"><div class="t">${pretty(c.date)} · ${t12(c.start_time)} <span class="pill ${c.status}">${c.status}</span></div>
       <div class="m">${esc(c.client)} — ${esc(c.type)} (~${c.duration_hours}h)</div>
       <div class="m">${esc(c.address)}</div>${c.notes ? `<div class="m">📝 ${esc(c.notes)}</div>` : ''}
+      ${c.access_info && c.status !== 'done' ? `<div class="access">🔑 ${esc(c.access_info)}</div>` : ''}
+      ${c.clock_in ? `<div class="m hint">⏱ Started ${new Date(c.clock_in).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}${c.clock_out ? ' · finished ' + new Date(c.clock_out).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'}) + ' (' + fmtDur(c.clock_in, c.clock_out) + ')' : ''}</div>` : ''}
       <div class="actions">${c.status === 'assigned' ? `<button class="btn sm" data-confirm="${c.id}">Confirm I'll be there</button>` : ''}
+        ${['assigned','confirmed'].includes(c.status) && !c.clock_in ? `<button class="btn sm" data-in="${c.id}">▶ Clock in</button>` : ''}
+        ${['assigned','confirmed'].includes(c.status) && c.clock_in ? `<button class="btn sm" data-tasks="${c.id}">☑ Checklist${c.tasks_total ? ` (${c.tasks_done}/${c.tasks_total})` : ''} &amp; finish</button>` : ''}
+        ${c.status === 'done' ? `<button class="btn sm sec" data-tasks="${c.id}">☑ View checklist</button>` : ''}
+        <button class="btn sm sec" data-sup="${c.id}">🧴 Need supplies</button>
+        ${['assigned','confirmed'].includes(c.status) && !c.clock_in ? `<button class="btn sm danger" data-cant="${c.id}">Can't make it</button>` : ''}
         <button class="btn sm sec" data-media="${c.id}">📷 Photos &amp; video</button>
         <button class="btn sm sec" data-msg="${c.id}">💬 Messages${c.unread ? `<span class="badge">${c.unread}</span>` : ''}</button></div>
     </div>`).join('') : '<div class="empty">No cleans assigned to you yet.</div>';
   $('#mine').querySelectorAll('[data-media]').forEach(b => b.onclick = () => cleanerMediaModal(cmap[b.dataset.media]));
+  $('#mine').querySelectorAll('[data-in]').forEach(b => b.onclick = async () => { try { await api(`/api/me/cleans/${b.dataset.in}/clock-in`, { method:'POST' }); cleanerView(); } catch (e) { alert(e.message); } });
+  $('#mine').querySelectorAll('[data-tasks]').forEach(b => b.onclick = () => cleanerTasksModal(cmap[b.dataset.tasks]));
+  $('#mine').querySelectorAll('[data-sup]').forEach(b => b.onclick = () => suppliesModal(cmap[b.dataset.sup]));
+  $('#mine').querySelectorAll('[data-cant]').forEach(b => b.onclick = async () => {
+    const reason = prompt("Can't make this clean? Tell Nicole why (she'll find someone else):"); if (!reason || !reason.trim()) return;
+    try { await api(`/api/me/cleans/${b.dataset.cant}/cant-make-it`, { method:'POST', body:{ reason } }); cleanerView(); } catch (e) { alert(e.message); } });
   $('#mine').querySelectorAll('[data-msg]').forEach(b => b.onclick = () => chatModal(cmap[b.dataset.msg], 'cleaner'));
   $('#mine').querySelectorAll('[data-confirm]').forEach(b => b.onclick = async () => { await api(`/api/me/cleans/${b.dataset.confirm}/confirm`, { method:'POST' }); cleanerView(); });
 
@@ -182,13 +208,16 @@ let adminTab = 'board', weekStart = mondayOf(new Date());
 
 function adminView() {
   $('#app').innerHTML = `
-    <div class="tabs"><button data-t="board">Schedule</button><button data-t="cleaners">Cleaners</button></div>
+    <div class="tabs"><button data-t="board">Schedule</button><button data-t="props">Properties</button><button data-t="supplies" id="suptab">Supplies</button><button data-t="cleaners">Cleaners</button></div>
     <div id="body"></div>`;
+  api('/api/admin/supplies').then(l => { const n = l.filter(x => x.status === 'open').length; if (n && $('#suptab')) $('#suptab').innerHTML = `Supplies<span class="badge">${n}</span>`; }).catch(() => {});
   document.querySelectorAll('.tabs button').forEach(b => { b.classList.toggle('on', b.dataset.t === adminTab); b.onclick = () => { adminTab = b.dataset.t; adminView(); }; });
-  adminTab === 'board' ? boardView() : cleanersView();
+  ({ board: boardView, props: propsView, supplies: suppliesView, cleaners: cleanersView })[adminTab]();
 }
 
+let genDone = false;
 async function boardView() {
+  if (!genDone) { genDone = true; await api('/api/admin/recurring/generate', { method:'POST' }).catch(() => {}); }
   const from = iso(weekStart), to = iso(addDays(weekStart, 6));
   const [{ cleans, availability }, requests] = await Promise.all([api(`/api/admin/board?from=${from}&to=${to}`), api('/api/admin/requests')]);
   const open = cleans.filter(c => c.status === 'open').length;
@@ -212,14 +241,19 @@ async function boardView() {
     html += `<div class="day"><h3>${pretty(ds)}</h3>
       <div class="avail">${av.length ? 'Available: ' + av.map(a => `<b>${esc(a.name)}</b> ${t12(a.start_time)}–${t12(a.end_time)}`).join(' · ') : 'No one posted'}</div>
       ${dc.map(c => `<div class="clean ${c.status}">
-        <div class="t">${t12(c.start_time)} · ${esc(c.client)} <span class="pill ${c.status}">${c.status}</span></div>
+        <div class="t">${t12(c.start_time)} · ${esc(c.client)} <span class="pill ${c.status}">${c.status}</span>${c.rule_id ? ' 🔁' : ''}</div>
         <div class="m">${esc(c.type)} · ~${c.duration_hours}h${c.address ? ' · ' + esc(c.address) : ''}</div>
         ${c.notes ? `<div class="m">📝 ${esc(c.notes)}</div>` : ''}
         ${c.source === 'client' ? `<div class="m">☎ ${esc(c.contact_phone || c.contact_email || '')}</div>` : ''}
         ${c.cleaner_name ? `<div class="m">👤 <b>${esc(c.cleaner_name)}</b></div>` : ''}
+        ${c.release_note && !c.cleaner_id ? `<div class="warnbox">⚠ Can't make it — ${esc(c.release_note)}</div>` : ''}
+        ${c.clock_in ? `<div class="m hint">⏱ In ${new Date(c.clock_in).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}${c.clock_out ? ' · out ' + new Date(c.clock_out).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'}) + ' · ' + fmtDur(c.clock_in, c.clock_out) + ' (est. ' + c.duration_hours + 'h)' : ' · on site'}</div>` : ''}
+        ${c.tasks_total ? `<div class="m hint">☑ Checklist ${c.tasks_done}/${c.tasks_total}</div>` : ''}
         <div class="actions">
           ${c.cleaner_id ? `<button class="btn sm sec" data-un="${c.id}">Unassign</button>` : `<button class="btn sm" data-as="${c.id}">Assign</button>`}
           <button class="btn sm sec" data-ed="${c.id}">Edit</button>
+          <button class="btn sm sec" data-rp="${c.id}">🔁 Repeat</button>
+          <button class="btn sm sec" data-ck="${c.id}">☑ Checklist</button>
           ${c.cleaner_id ? `<button class="btn sm sec" data-mc="${c.id}">💬 Crew${c.unread_crew ? `<span class="badge">${c.unread_crew}</span>` : ''}</button>` : ''}
           <button class="btn sm sec" data-mo="${c.id}">💬 Owner${c.unread_client ? `<span class="badge">${c.unread_client}</span>` : ''}</button>
           ${['assigned','confirmed','done'].includes(c.status) ? `<button class="btn sm sec" data-md="${c.id}">📷 Media / report${c.report_published ? ' ✓' : ''}</button>` : ''}
@@ -239,6 +273,8 @@ async function boardView() {
   on('data-ap', async id => { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'open' } }); boardView(); });
   on('data-dc', async id => { if (confirm('Decline this request?')) { await api(`/api/admin/cleans/${id}`, { method:'PATCH', body:{ status:'declined' } }); boardView(); } });
   on('data-md', id => adminMediaModal(byId[id]));
+  on('data-rp', id => repeatModal(byId[id]));
+  on('data-ck', id => adminTasksModal(byId[id]));
   on('data-mc', id => chatModal(byId[id], 'admin', 'crew'));
   on('data-mo', id => chatModal(byId[id], 'admin', 'client'));
   on('data-un', async id => { await api(`/api/admin/cleans/${id}/unassign`, { method:'POST' }); boardView(); });
@@ -252,9 +288,13 @@ function modal(inner) {
   document.body.appendChild(m); return m;
 }
 
-function cleanForm(c) {
+async function cleanForm(c) {
+  const props = (await api('/api/admin/properties').catch(() => [])).filter(p => p.active || (c && c.property_id === p.id));
+  let propId = c?.property_id || null;
   const v = c || { date: iso(weekStart), start_time: '10:00', duration_hours: 2, type: 'Airbnb turnover', client: '', address: '', notes: '' };
   const m = modal(`<h2>${c ? 'Edit' : 'Post'} clean</h2>
+    <label>Saved property (fills everything in)</label>
+    <select id="f_prop"><option value="">— type it in manually —</option>${props.map(p => `<option value="${p.id}" ${p.id === propId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select>
     <div class="row"><div><label>Date</label><input type="date" id="f_date" value="${v.date}"></div><div><label>Start</label><input type="time" id="f_st" value="${v.start_time}"></div></div>
     <div class="row"><div><label>Hours (est.)</label><input type="number" step="0.5" min="0.5" id="f_dur" value="${v.duration_hours}"></div>
       <div><label>Type</label><select id="f_type">${['Airbnb turnover','Residential','Commercial','Carpet','Tile/grout','Upholstery','Deep clean','Other'].map(t => `<option ${t === v.type ? 'selected' : ''}>${t}</option>`).join('')}</select></div></div>
@@ -266,8 +306,14 @@ function cleanForm(c) {
     <div class="err" id="f_err"></div>
     <div class="actions"><button class="btn" id="f_save">Save</button><button class="btn sec" id="f_x">Close</button></div>`);
   $('#f_x', m).onclick = () => m.remove();
+  $('#f_prop', m).addEventListener('change', e => {
+    propId = +e.target.value || null; const p = props.find(x => x.id === propId); if (!p) return;
+    $('#f_client', m).value = p.name; $('#f_addr', m).value = p.address || ''; $('#f_dur', m).value = p.default_hours;
+    if ([...$('#f_type', m).options].some(o => o.text === p.default_type)) $('#f_type', m).value = p.default_type;
+    $('#f_cphone', m).value = p.owner_phone || ''; $('#f_cemail', m).value = p.owner_email || '';
+  });
   $('#f_save', m).onclick = async () => {
-    const body = { date: $('#f_date', m).value, start_time: $('#f_st', m).value, duration_hours: +$('#f_dur', m).value, type: $('#f_type', m).value,
+    const body = { property_id: propId, contact_name: props.find(x => x.id === propId)?.owner_name || c?.contact_name || null, date: $('#f_date', m).value, start_time: $('#f_st', m).value, duration_hours: +$('#f_dur', m).value, type: $('#f_type', m).value,
       client: $('#f_client', m).value.trim(), contact_phone: $('#f_cphone', m).value.trim() || null, contact_email: $('#f_cemail', m).value.trim() || null, address: $('#f_addr', m).value.trim(), notes: $('#f_notes', m).value.trim() };
     try { await api(c ? `/api/admin/cleans/${c.id}` : '/api/admin/cleans', { method: c ? 'PATCH' : 'POST', body }); m.remove(); weekStart = mondayOf(parse(body.date)); boardView(); }
     catch (e) { $('#f_err', m).textContent = e.message; }
@@ -467,6 +513,130 @@ async function chatModal(c, viewer, thread = 'crew') {
   }
   load();
 }
+
+// ---------------- checklist / supplies / properties / recurring ----------------
+function fmtDur(a, b) { const mins = Math.max(0, Math.round((new Date(b) - new Date(a)) / 60000)); return mins >= 60 ? `${Math.floor(mins/60)}h ${mins%60}m` : `${mins}m`; }
+
+async function cleanerTasksModal(c) {
+  const tasks = await api(`/api/me/cleans/${c.id}/tasks`);
+  const locked = c.status === 'done';
+  const m = modal(`<h2>Checklist</h2><div class="m hint">${esc(c.client)} · ${pretty(c.date)}</div><div id="tl"></div>
+    <div class="err" id="terr"></div>
+    <div class="actions">${locked ? '' : '<button class="btn" id="tfin">✔ Finish clean</button>'}<button class="btn sec" id="tx">Close</button></div>
+    ${locked ? '' : '<div class="hint" style="margin-top:6px">Tick every task, take your After photos/video, then tap Finish. That clocks you out.</div>'}`);
+  const draw = () => { $('#tl', m).innerHTML = tasks.map(t => `<label class="task ${t.done ? 'done' : ''}" style="margin:0;color:inherit;font-size:16px"><input type="checkbox" data-id="${t.id}" ${t.done ? 'checked' : ''} ${locked ? 'disabled' : ''}><span>${esc(t.label)}</span></label>`).join('');
+    m.querySelectorAll('input[data-id]').forEach(cb => cb.addEventListener('change', async () => {
+      const t = tasks.find(x => x.id == cb.dataset.id); t.done = cb.checked;
+      try { await api('/api/me/tasks/' + t.id, { method:'POST', body:{ done: cb.checked } }); draw(); } catch (e) { t.done = !cb.checked; $('#terr', m).textContent = e.message; draw(); } })); };
+  draw();
+  const close = () => { m.remove(); cleanerView(); };
+  m.onclick = e => { if (e.target === m) close(); };
+  $('#tx', m).onclick = close;
+  if (!locked) $('#tfin', m).onclick = async () => {
+    try { await api(`/api/me/cleans/${c.id}/finish`, { method:'POST' }); close(); } catch (e) { $('#terr', m).textContent = e.message; } };
+}
+
+async function suppliesModal(c) {
+  const m = modal(`<h2>Need supplies?</h2><div class="m hint">${esc(c.client)}</div>
+    <label>What do you need?</label><input id="si" placeholder="e.g. toilet paper, trash bags, glass cleaner">
+    <div class="err" id="serr"></div><div class="actions"><button class="btn" id="ss">Send to Nicole</button><button class="btn sec" id="sx">Close</button></div>
+    <h3 style="margin:14px 0 4px;font-size:15px">My recent requests</h3><div id="sl"></div>`);
+  const load = async () => { const l = await api('/api/me/supplies'); $('#sl', m).innerHTML = l.length ? l.map(x => `<div class="cand"><div>${esc(x.item)}<div class="w">${esc(x.client || '')}</div></div><span class="pill ${x.status === 'done' ? 'done' : 'open'}">${x.status}</span></div>`).join('') : '<div class="empty">None yet.</div>'; };
+  $('#sx', m).onclick = () => m.remove();
+  $('#ss', m).onclick = async () => { const item = $('#si', m).value.trim(); if (!item) return;
+    try { await api('/api/me/supplies', { method:'POST', body:{ item, clean_id: c.id } }); $('#si', m).value = ''; $('#serr', m).textContent = ''; load(); } catch (e) { $('#serr', m).textContent = e.message; } };
+  load();
+}
+
+async function adminTasksModal(c) {
+  const m = modal(`<h2>Checklist</h2><div class="m hint">${esc(c.client)} · ${pretty(c.date)}</div><div id="tl"></div>
+    <div class="row"><input id="tn" placeholder="Add a task for this clean…"><button class="btn sm" id="ta" style="flex:none;min-width:70px">Add</button></div>
+    <div class="err" id="terr"></div><div class="actions"><button class="btn sec" id="tx">Close</button></div>
+    <div class="hint" style="margin-top:6px">To change the standard list for a property, edit it under Properties.</div>`);
+  const load = async () => { const tasks = await api(`/api/admin/cleans/${c.id}/tasks`);
+    $('#tl', m).innerHTML = tasks.map(t => `<div class="task ${t.done ? 'done' : ''}"><span>${t.done ? '✅' : '⬜'} ${esc(t.label)}</span><button data-d="${t.id}" title="Remove">×</button></div>`).join('');
+    m.querySelectorAll('[data-d]').forEach(b => b.onclick = async () => { await api('/api/admin/tasks/' + b.dataset.d, { method:'DELETE' }); load(); }); };
+  $('#ta', m).onclick = async () => { const label = $('#tn', m).value.trim(); if (!label) return;
+    try { await api(`/api/admin/cleans/${c.id}/tasks`, { method:'POST', body:{ label } }); $('#tn', m).value = ''; load(); } catch (e) { $('#terr', m).textContent = e.message; } };
+  const close = () => { m.remove(); boardView(); };
+  m.onclick = e => { if (e.target === m) close(); }; $('#tx', m).onclick = close;
+  load();
+}
+
+function repeatModal(c) {
+  const next = iso(addDays(parse(c.date), 7));
+  const m = modal(`<h2>Repeat this clean</h2><div class="m hint">${esc(c.client)} · ${pretty(c.date)} · ${t12(c.start_time)}</div>
+    <h3 style="margin:12px 0 4px;font-size:15px">Copy once</h3>
+    <div class="row"><input type="date" id="rp_d" value="${next}"><button class="btn sm" id="rp_once" style="flex:none">Copy to this date</button></div>
+    <h3 style="margin:14px 0 4px;font-size:15px">Make it recurring</h3>
+    ${c.rule_id ? '<div class="hint">This clean is already part of a recurring schedule (manage it under Properties → Recurring).</div>' : `
+    <div class="row"><select id="rp_n"><option value="1">Every week</option><option value="2">Every 2 weeks</option><option value="3">Every 3 weeks</option><option value="4">Every 4 weeks</option></select>
+    <button class="btn sm" id="rp_rec" style="flex:none">Start schedule</button></div>
+    <div class="hint">Same weekday and time as this clean (${pretty(c.date).split(',')[0]}s). New cleans appear on the board automatically, 6 weeks ahead, as "needs a cleaner".</div>`}
+    <div class="err" id="rp_err"></div><div class="actions"><button class="btn sec" id="rp_x">Close</button></div>`);
+  $('#rp_x', m).onclick = () => m.remove();
+  $('#rp_once', m).onclick = async () => { try { const d = $('#rp_d', m).value; await api(`/api/admin/cleans/${c.id}/repeat`, { method:'POST', body:{ date: d } }); m.remove(); weekStart = mondayOf(parse(d)); boardView(); } catch (e) { $('#rp_err', m).textContent = e.message; } };
+  if (!c.rule_id) $('#rp_rec', m).onclick = async () => { try { await api('/api/admin/recurring', { method:'POST', body:{ clean_id: c.id, every_weeks: +$('#rp_n', m).value } }); m.remove(); boardView(); } catch (e) { $('#rp_err', m).textContent = e.message; } };
+}
+
+async function propsView() {
+  const [list, rules] = await Promise.all([api('/api/admin/properties'), api('/api/admin/recurring')]);
+  $('#body').innerHTML = `<div class="card"><h2>Saved properties</h2><div class="hint" style="margin-bottom:8px">Save each property once: address, owner contact, door/lockbox info (shown only to the assigned cleaner) and its own checklist.</div>
+    <button class="btn" id="pn">＋ Add property</button><div style="margin-top:10px">${list.map(p => `<div class="cand"><div><b>${esc(p.name)}</b> ${p.active ? '' : '<span class="pill done">inactive</span>'}
+      <div class="w">${esc(p.address || 'no address')}${p.owner_name ? ' · ' + esc(p.owner_name) : ''}${p.access_info ? ' · 🔑' : ''}${p.checklist ? ' · custom checklist' : ''}</div></div>
+      <div class="actions"><button class="btn sm sec" data-pe="${p.id}">Edit</button></div></div>`).join('') || '<div class="empty">No properties yet.</div>'}</div></div>
+    <div class="card"><h2>🔁 Recurring cleans</h2>${rules.map(r => `<div class="cand"><div><b>${esc(r.client)}</b> ${r.active ? '' : '<span class="pill done">paused</span>'}
+      <div class="w">Every ${r.every_weeks === 1 ? 'week' : r.every_weeks + ' weeks'} · ${parse(r.start_date).toLocaleDateString(undefined, { weekday:'long' })}s at ${t12(r.start_time)} · ${esc(r.type)}</div></div>
+      <div class="actions"><button class="btn sm sec" data-rt="${r.id}" data-v="${r.active ? 0 : 1}">${r.active ? 'Pause' : 'Resume'}</button><button class="btn sm danger" data-rd="${r.id}">Delete</button></div></div>`).join('')
+      || '<div class="empty">None yet. On the Schedule, tap 🔁 Repeat on a clean and choose "Make it recurring".</div>'}
+      <div class="hint" style="margin-top:6px">Pausing or deleting cancels the future cleans from that schedule that nobody is assigned to yet.</div></div>`;
+  $('#pn').onclick = () => propertyForm();
+  document.querySelectorAll('[data-pe]').forEach(b => b.onclick = () => propertyForm(list.find(p => p.id == b.dataset.pe)));
+  document.querySelectorAll('[data-rt]').forEach(b => b.onclick = async () => { await api('/api/admin/recurring/' + b.dataset.rt, { method:'PATCH', body:{ active: b.dataset.v === '1' } }); propsView(); });
+  document.querySelectorAll('[data-rd]').forEach(b => b.onclick = async () => { if (confirm('Delete this recurring schedule? Future unassigned cleans from it will be cancelled.')) { await api('/api/admin/recurring/' + b.dataset.rd, { method:'DELETE' }); propsView(); } });
+}
+
+function propertyForm(p) {
+  const v = p || { name:'', address:'', owner_name:'', owner_phone:'', owner_email:'', access_info:'', checklist:'', default_type:'Airbnb turnover', default_hours:2, active:true };
+  const m = modal(`<h2>${p ? 'Edit' : 'Add'} property</h2>
+    <label>Property name</label><input id="p_name" value="${esc(v.name)}" placeholder="e.g. Ocean View Condo 4B">
+    <label>Address</label><input id="p_addr" value="${esc(v.address)}">
+    <div class="row"><div><label>Owner name</label><input id="p_on" value="${esc(v.owner_name || '')}"></div><div><label>Owner phone</label><input id="p_op" type="tel" value="${esc(v.owner_phone || '')}"></div></div>
+    <label>Owner email</label><input id="p_oe" type="email" value="${esc(v.owner_email || '')}">
+    <div class="row"><div><label>Usual type</label><select id="p_type">${['Airbnb turnover','Residential','Commercial','Carpet','Tile/grout','Upholstery','Deep clean','Other'].map(t => `<option ${t === v.default_type ? 'selected' : ''}>${t}</option>`).join('')}</select></div>
+      <div><label>Usual hours</label><input id="p_hrs" type="number" step="0.5" min="0.5" value="${v.default_hours}"></div></div>
+    <label>🔑 Access info (door/lockbox code, parking, where supplies are) — only the assigned cleaner sees this</label><textarea id="p_acc" rows="3">${esc(v.access_info)}</textarea>
+    <label>☑ Checklist for this property (one task per line; leave blank to use the standard list)</label><textarea id="p_ck" rows="5" placeholder="Kitchen: counters, sink, appliances, floor&#10;Bathrooms: toilet, shower/tub, sink, mirror&#10;Bedrooms: change linens&#10;Restock towels, soap, toilet paper&#10;Take AFTER photos / video">${esc(v.checklist)}</textarea>
+    <div class="err" id="p_err"></div>
+    <div class="actions"><button class="btn" id="p_save">Save</button>${p ? `<button class="btn sm ${p.active ? 'danger' : 'sec'}" id="p_act">${p.active ? 'Archive' : 'Restore'}</button>` : ''}<button class="btn sec" id="p_x">Close</button></div>
+    <div class="hint" style="margin-top:6px">Checklist changes apply to future cleans. A clean that already has its checklist keeps it.</div>`);
+  $('#p_x', m).onclick = () => m.remove();
+  $('#p_save', m).onclick = async () => {
+    const body = { name: $('#p_name', m).value, address: $('#p_addr', m).value, owner_name: $('#p_on', m).value, owner_phone: $('#p_op', m).value, owner_email: $('#p_oe', m).value,
+      default_type: $('#p_type', m).value, default_hours: +$('#p_hrs', m).value, access_info: $('#p_acc', m).value, checklist: $('#p_ck', m).value };
+    try { await api(p ? '/api/admin/properties/' + p.id : '/api/admin/properties', { method: p ? 'PATCH' : 'POST', body }); m.remove(); propsView(); } catch (e) { $('#p_err', m).textContent = e.message; } };
+  if (p) $('#p_act', m).onclick = async () => { await api('/api/admin/properties/' + p.id, { method:'PATCH', body:{ active: !p.active } }); m.remove(); propsView(); };
+}
+
+async function suppliesView() {
+  const list = await api('/api/admin/supplies');
+  $('#body').innerHTML = `<div class="card"><h2>🧴 Supply requests</h2>${list.map(x => `<div class="cand"><div><b>${esc(x.item)}</b> <span class="pill ${x.status === 'done' ? 'done' : x.status === 'ordered' ? 'assigned' : 'open'}">${x.status}</span>
+    <div class="w">${esc(x.cleaner_name || '')}${x.client ? ' · ' + esc(x.client) : ''}${x.date ? ' · ' + pretty(x.date) : ''} · ${fmtTime(x.created_at)}</div></div>
+    <div class="actions">${x.status === 'open' ? `<button class="btn sm sec" data-s="${x.id}" data-v="ordered">Ordered</button>` : ''}${x.status !== 'done' ? `<button class="btn sm" data-s="${x.id}" data-v="done">Done</button>` : ''}</div></div>`).join('') || '<div class="empty">No supply requests. 🎉</div>'}</div>`;
+  document.querySelectorAll('[data-s]').forEach(b => b.onclick = async () => { await api('/api/admin/supplies/' + b.dataset.s, { method:'PATCH', body:{ status: b.dataset.v } }); adminView(); });
+}
+
+// ---------------- install as app ----------------
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+let deferredInstall = null;
+const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+window.addEventListener('beforeinstallprompt', e => { e.preventDefault(); deferredInstall = e; $('#install').hidden = false; });
+if (!standalone && /iphone|ipad|ipod/i.test(navigator.userAgent)) $('#install').hidden = false;
+$('#install').addEventListener('click', async () => {
+  if (deferredInstall) { deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; $('#install').hidden = true; }
+  else modal('<h2>Add to your home screen</h2><p><b>iPhone / iPad (Safari):</b> tap the Share button, then <b>Add to Home Screen</b>.</p><p><b>Android (Chrome):</b> tap the ⋮ menu, then <b>Install app</b> / <b>Add to Home screen</b>.</p><div class="actions"><button class="btn" onclick="this.closest(\'.modal\').remove()">Got it</button></div>');
+});
+window.addEventListener('appinstalled', () => { $('#install').hidden = true; });
 
 render();
 </script>

@@ -67,7 +67,8 @@ const noteFail = (k: string) => { const f = fails.get(k) ?? { n: 0, t: 0 }; fail
 
 // ---- column fragments ----
 const CLEAN_COLS = sql`c.id, c.date::text AS date, to_char(c.start_time,'HH24:MI') AS start_time, c.duration_hours::float AS duration_hours,
-  c.client, c.address, c.type, c.notes, c.status, c.cleaner_id, c.contact_name, c.contact_phone, c.contact_email, c.source, c.report_published`;
+  c.client, c.address, c.type, c.notes, c.status, c.cleaner_id, c.contact_name, c.contact_phone, c.contact_email, c.source, c.report_published,
+  c.property_id, c.rule_id, c.clock_in, c.clock_out, c.release_note`;
 const AVAIL_COLS = sql`a.id, a.cleaner_id, a.date::text AS date, to_char(a.start_time,'HH24:MI') AS start_time, to_char(a.end_time,'HH24:MI') AS end_time, a.note`;
 
 async function mediaFor(cleanId: number) {
@@ -89,6 +90,24 @@ async function threadFor(cleanId: number | string, thread: string, viewer: Viewe
   await sql`UPDATE coastal.clean_messages SET seen = true WHERE clean_id = ${cleanId} AND thread = ${thread} AND sender != ${viewer} AND NOT seen`;
   return await sql`SELECT id, thread, sender, body, fee_cents, fee_status, created_at FROM coastal.clean_messages
     WHERE clean_id = ${cleanId} AND thread = ${thread} ORDER BY id`;
+}
+const DEFAULT_TASKS = ["Kitchen: counters, sink, appliances, floor", "Bathrooms: toilet, shower/tub, sink, mirror, floor", "Bedrooms: change linens, dust, vacuum", "Living areas: dust, vacuum/mop", "Empty all trash and replace liners", "Restock towels, soap, toilet paper", "Check for damage or left-behind items (take photos)", "Take AFTER photos / video"];
+async function ensureTasks(cleanId: number | string) {
+  const [{ n }] = await sql`SELECT count(*)::int AS n FROM coastal.clean_tasks WHERE clean_id = ${cleanId}`;
+  if (n === 0) {
+    const [p] = await sql`SELECT p.checklist FROM coastal.cleans c JOIN coastal.properties p ON p.id = c.property_id WHERE c.id = ${cleanId}`;
+    const lines = String(p?.checklist ?? "").split("\n").map((x) => x.trim()).filter(Boolean).slice(0, 40);
+    const list = lines.length ? lines : DEFAULT_TASKS;
+    for (let i = 0; i < list.length; i++) await sql`INSERT INTO coastal.clean_tasks (clean_id, label, sort) VALUES (${cleanId}, ${list[i].slice(0, 200)}, ${i})`;
+  }
+  return await sql`SELECT id, label, done FROM coastal.clean_tasks WHERE clean_id = ${cleanId} ORDER BY sort, id`;
+}
+async function generateRecurring() {
+  await sql`INSERT INTO coastal.cleans (date, start_time, duration_hours, client, address, type, notes, status, contact_name, contact_phone, contact_email, property_id, rule_id, source)
+    SELECT d::date, r.start_time, r.duration_hours, r.client, r.address, r.type, r.notes, 'open', r.contact_name, r.contact_phone, r.contact_email, r.property_id, r.id, 'recurring'
+    FROM coastal.recurring_rules r, generate_series(greatest(r.start_date, ${today()}::date), ${today()}::date + 42, interval '1 day') d
+    WHERE r.active AND (d::date - r.start_date) % (7 * r.every_weeks) = 0 AND (r.end_date IS NULL OR d::date <= r.end_date)
+    ON CONFLICT (rule_id, date) WHERE rule_id IS NOT NULL DO NOTHING`;
 }
 const clipText = (v: unknown, n: number) => String(v ?? "").trim().slice(0, n);
 // Client link works once the report is published, or once Nicole has messaged the owner about this clean.
@@ -249,7 +268,10 @@ Deno.serve(async (req) => {
       if (path === "/api/me/cleans" && method === "GET") {
         const from = url.searchParams.get("from") || today();
         return json(await sql`SELECT ${CLEAN_COLS},
-          (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'crew' AND mm.sender = 'admin' AND NOT mm.seen)::int AS unread
+          (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'crew' AND mm.sender = 'admin' AND NOT mm.seen)::int AS unread,
+          (SELECT p.access_info FROM coastal.properties p WHERE p.id = c.property_id) AS access_info,
+          (SELECT count(*) FROM coastal.clean_tasks t WHERE t.clean_id = c.id)::int AS tasks_total,
+          (SELECT count(*) FROM coastal.clean_tasks t WHERE t.clean_id = c.id AND t.done)::int AS tasks_done
           FROM coastal.cleans c WHERE c.cleaner_id = ${me} AND c.date >= ${from}
           AND c.status != 'cancelled' ORDER BY c.date, c.start_time`);
       }
@@ -300,6 +322,54 @@ Deno.serve(async (req) => {
           return json({ ok: true });
         }
       }
+      m = path.match(/^\/api\/me\/cleans\/(\d+)\/tasks$/);
+      if (m && method === "GET") {
+        if (!(await ownClean(m[1], me))) return bad("Not your clean", 404);
+        return json(await ensureTasks(m[1]));
+      }
+      m = path.match(/^\/api\/me\/tasks\/(\d+)$/);
+      if (m && method === "POST") {
+        const r = await sql`UPDATE coastal.clean_tasks t SET done = ${!!body.done}, done_at = ${body.done ? new Date() : null}
+          FROM coastal.cleans c WHERE t.id = ${m[1]} AND c.id = t.clean_id AND c.cleaner_id = ${me} AND c.status IN ('assigned','confirmed','done') RETURNING t.id`;
+        return r.length ? json({ ok: true }) : bad("Not found", 404);
+      }
+      m = path.match(/^\/api\/me\/cleans\/(\d+)\/(clock-in|finish|cant-make-it)$/);
+      if (m && method === "POST") {
+        const [c] = await sql`SELECT id, status, clock_in FROM coastal.cleans WHERE id = ${m[1]} AND cleaner_id = ${me} AND status IN ('assigned','confirmed','done')`;
+        if (!c) return bad("Not your clean", 404);
+        if (m[2] === "clock-in") {
+          if (c.status === "done") return bad("This clean is already finished");
+          await sql`UPDATE coastal.cleans SET clock_in = coalesce(clock_in, now()), status = 'confirmed' WHERE id = ${c.id}`;
+          return json({ ok: true });
+        }
+        if (m[2] === "finish") {
+          if (c.status === "done") return json({ ok: true });
+          const tasks = await ensureTasks(c.id);
+          const left = tasks.filter((t: any) => !t.done).length;
+          if (left) return bad(`Finish the checklist first (${left} task${left === 1 ? "" : "s"} left)`, 409);
+          await sql`UPDATE coastal.cleans SET clock_in = coalesce(clock_in, now()), clock_out = now(), status = 'done' WHERE id = ${c.id}`;
+          return json({ ok: true });
+        }
+        // cant-make-it
+        const reason = clipText(body.reason, 300);
+        if (!reason) return bad("Please tell Nicole why");
+        if (c.clock_in || c.status === "done") return bad("You already started this clean. Message Nicole instead.", 409);
+        const [who] = await sql`SELECT name FROM coastal.cleaners WHERE id = ${me}`;
+        await sql`INSERT INTO coastal.clean_messages (clean_id, thread, sender, body) VALUES (${c.id}, 'crew', 'cleaner', ${"Can't make this clean: " + reason})`;
+        await sql`UPDATE coastal.cleans SET cleaner_id = NULL, status = 'open', release_note = ${who.name + ": " + reason} WHERE id = ${c.id}`;
+        return json({ ok: true });
+      }
+      if (path === "/api/me/supplies" && method === "POST") {
+        const item = clipText(body.item, 200);
+        if (!item) return bad("What do you need?");
+        let cid: number | null = null;
+        if (body.clean_id) { if (!(await ownClean(String(body.clean_id), me))) return bad("Not your clean", 404); cid = Number(body.clean_id); }
+        await sql`INSERT INTO coastal.supply_requests (clean_id, cleaner_id, item) VALUES (${cid}, ${me}, ${item})`;
+        return json({ ok: true });
+      }
+      if (path === "/api/me/supplies" && method === "GET")
+        return json(await sql`SELECT s.id, s.item, s.status, s.created_at, c.client FROM coastal.supply_requests s LEFT JOIN coastal.cleans c ON c.id = s.clean_id
+          WHERE s.cleaner_id = ${me} ORDER BY s.id DESC LIMIT 15`);
       m = path.match(/^\/api\/me\/cleans\/(\d+)\/confirm$/);
       if (m && method === "POST") {
         const r = await sql`UPDATE coastal.cleans SET status = 'confirmed' WHERE id = ${m[1]} AND cleaner_id = ${me} AND status = 'assigned' RETURNING id`;
@@ -312,6 +382,86 @@ Deno.serve(async (req) => {
     if (path.startsWith("/api/admin/")) {
       if (user.role !== "admin") return bad("Not allowed", 403);
 
+      // ---- properties ----
+      if (path === "/api/admin/properties" && method === "GET")
+        return json(await sql`SELECT id, name, address, owner_name, owner_phone, owner_email, access_info, checklist, default_type, default_hours::float AS default_hours, active FROM coastal.properties ORDER BY active DESC, name`);
+      const propFields = (b: any) => ({ name: clipText(b.name, 120), address: clipText(b.address, 200), owner_name: clipText(b.owner_name, 100) || null,
+        owner_phone: clipText(b.owner_phone, 30) || null, owner_email: clipText(b.owner_email, 120) || null, access_info: clipText(b.access_info, 1500),
+        checklist: clipText(b.checklist, 4000), default_type: clipText(b.default_type, 40) || "Airbnb turnover",
+        default_hours: Number(b.default_hours) > 0 && Number(b.default_hours) <= 16 ? Number(b.default_hours) : 2 });
+      if (path === "/api/admin/properties" && method === "POST") {
+        const f = propFields(body); if (!f.name) return bad("Property name required");
+        const [r] = await sql`INSERT INTO coastal.properties (name, address, owner_name, owner_phone, owner_email, access_info, checklist, default_type, default_hours)
+          VALUES (${f.name}, ${f.address}, ${f.owner_name}, ${f.owner_phone}, ${f.owner_email}, ${f.access_info}, ${f.checklist}, ${f.default_type}, ${f.default_hours}) RETURNING id`;
+        return json({ id: Number(r.id) });
+      }
+      let m = path.match(/^\/api\/admin\/properties\/(\d+)$/);
+      if (m && method === "PATCH") {
+        const [cur] = await sql`SELECT * FROM coastal.properties WHERE id = ${m[1]}`;
+        if (!cur) return bad("Not found", 404);
+        if (Object.keys(body).length === 1 && "active" in body) { await sql`UPDATE coastal.properties SET active = ${!!body.active} WHERE id = ${m[1]}`; return json({ ok: true }); }
+        const f = propFields(body); if (!f.name) return bad("Property name required");
+        await sql`UPDATE coastal.properties SET name = ${f.name}, address = ${f.address}, owner_name = ${f.owner_name}, owner_phone = ${f.owner_phone}, owner_email = ${f.owner_email},
+          access_info = ${f.access_info}, checklist = ${f.checklist}, default_type = ${f.default_type}, default_hours = ${f.default_hours} WHERE id = ${m[1]}`;
+        return json({ ok: true });
+      }
+
+      // ---- recurring + repeat ----
+      if (path === "/api/admin/recurring/generate" && method === "POST") { await generateRecurring(); return json({ ok: true }); }
+      if (path === "/api/admin/recurring" && method === "GET")
+        return json(await sql`SELECT r.id, r.client, r.address, r.type, to_char(r.start_time,'HH24:MI') AS start_time, r.every_weeks, r.start_date::text AS start_date, r.end_date::text AS end_date, r.active
+          FROM coastal.recurring_rules r ORDER BY r.active DESC, r.client`);
+      if (path === "/api/admin/recurring" && method === "POST") {
+        const [c] = await sql`SELECT * FROM coastal.cleans WHERE id = ${Number(body.clean_id) || 0}`;
+        if (!c) return bad("Clean not found", 404);
+        const every = Math.min(8, Math.max(1, Number(body.every_weeks) || 1));
+        const [r] = await sql`INSERT INTO coastal.recurring_rules (property_id, client, address, type, start_time, duration_hours, notes, contact_name, contact_phone, contact_email, start_date, every_weeks)
+          VALUES (${c.property_id}, ${c.client}, ${c.address}, ${c.type}, ${c.start_time}, ${c.duration_hours}, ${c.notes ?? ""}, ${c.contact_name}, ${c.contact_phone}, ${c.contact_email}, ${c.date}, ${every}) RETURNING id`;
+        await sql`UPDATE coastal.cleans SET rule_id = ${r.id} WHERE id = ${c.id} AND rule_id IS NULL`;
+        await generateRecurring();
+        return json({ id: Number(r.id) });
+      }
+      m = path.match(/^\/api\/admin\/recurring\/(\d+)$/);
+      if (m && (method === "PATCH" || method === "DELETE")) {
+        const stop = method === "DELETE" || body.active === false;
+        if (stop) {
+          await sql`UPDATE coastal.cleans SET status = 'cancelled' WHERE rule_id = ${m[1]} AND status = 'open' AND date >= ${today()}`;
+          if (method === "DELETE") await sql`DELETE FROM coastal.recurring_rules WHERE id = ${m[1]}`;
+          else await sql`UPDATE coastal.recurring_rules SET active = false WHERE id = ${m[1]}`;
+        } else { await sql`UPDATE coastal.recurring_rules SET active = true WHERE id = ${m[1]}`; await generateRecurring(); }
+        return json({ ok: true });
+      }
+      m = path.match(/^\/api\/admin\/cleans\/(\d+)\/repeat$/);
+      if (m && method === "POST") {
+        if (!DATE_RE.test(body.date || "")) return bad("Pick a date");
+        const [r] = await sql`INSERT INTO coastal.cleans (date, start_time, duration_hours, client, address, type, notes, contact_name, contact_phone, contact_email, property_id)
+          SELECT ${body.date}, start_time, duration_hours, client, address, type, notes, contact_name, contact_phone, contact_email, property_id FROM coastal.cleans WHERE id = ${m[1]} RETURNING id`;
+        return r ? json({ id: Number(r.id) }) : bad("Not found", 404);
+      }
+
+      // ---- checklist (admin view/edit per clean) ----
+      m = path.match(/^\/api\/admin\/cleans\/(\d+)\/tasks$/);
+      if (m && method === "GET") return json(await ensureTasks(m[1]));
+      if (m && method === "POST") {
+        const label = clipText(body.label, 200); if (!label) return bad("Task text required");
+        await ensureTasks(m[1]);
+        await sql`INSERT INTO coastal.clean_tasks (clean_id, label, sort) VALUES (${m[1]}, ${label}, (SELECT coalesce(max(sort),0)+1 FROM coastal.clean_tasks WHERE clean_id = ${m[1]}))`;
+        return json({ ok: true });
+      }
+      m = path.match(/^\/api\/admin\/tasks\/(\d+)$/);
+      if (m && method === "DELETE") { await sql`DELETE FROM coastal.clean_tasks WHERE id = ${m[1]}`; return json({ ok: true }); }
+
+      // ---- supplies ----
+      if (path === "/api/admin/supplies" && method === "GET")
+        return json(await sql`SELECT s.id, s.item, s.status, s.created_at, c.client, c.date::text AS date, cl.name AS cleaner_name FROM coastal.supply_requests s
+          LEFT JOIN coastal.cleans c ON c.id = s.clean_id LEFT JOIN coastal.cleaners cl ON cl.id = s.cleaner_id
+          WHERE s.status != 'done' OR s.created_at > now() - interval '14 days' ORDER BY (s.status = 'done'), s.id DESC LIMIT 100`);
+      m = path.match(/^\/api\/admin\/supplies\/(\d+)$/);
+      if (m && method === "PATCH") {
+        if (!["open", "ordered", "done"].includes(body.status)) return bad("Bad status");
+        await sql`UPDATE coastal.supply_requests SET status = ${body.status} WHERE id = ${m[1]}`; return json({ ok: true });
+      }
+
       if (path === "/api/admin/cleaners" && method === "GET")
         return json(await sql`SELECT id, name, phone, pin, active FROM coastal.cleaners ORDER BY active DESC, name`);
       if (path === "/api/admin/cleaners" && method === "POST") {
@@ -319,7 +469,7 @@ Deno.serve(async (req) => {
         const [r] = await sql`INSERT INTO coastal.cleaners (name, phone, pin) VALUES (${String(body.name).trim()}, ${body.phone ?? ""}, ${body.pin}) RETURNING id`;
         return json({ id: Number(r.id) });
       }
-      let m = path.match(/^\/api\/admin\/cleaners\/(\d+)$/);
+      m = path.match(/^\/api\/admin\/cleaners\/(\d+)$/);
       if (m && method === "PATCH") {
         const [c] = await sql`SELECT * FROM coastal.cleaners WHERE id = ${m[1]}`;
         if (!c) return bad("Not found", 404);
@@ -333,8 +483,8 @@ Deno.serve(async (req) => {
         const b = { start_time: "10:00", duration_hours: 2, type: "Airbnb turnover", ...body };
         const err = validateClean(b);
         if (err) return bad(err);
-        const [r] = await sql`INSERT INTO coastal.cleans (date, start_time, duration_hours, client, address, type, notes, contact_name, contact_phone, contact_email)
-          VALUES (${b.date}, ${b.start_time}, ${b.duration_hours}, ${b.client}, ${b.address ?? ""}, ${b.type}, ${b.notes ?? ""}, ${b.contact_name ?? null}, ${b.contact_phone ?? null}, ${b.contact_email ?? null}) RETURNING id`;
+        const [r] = await sql`INSERT INTO coastal.cleans (date, start_time, duration_hours, client, address, type, notes, contact_name, contact_phone, contact_email, property_id)
+          VALUES (${b.date}, ${b.start_time}, ${b.duration_hours}, ${b.client}, ${b.address ?? ""}, ${b.type}, ${b.notes ?? ""}, ${b.contact_name ?? null}, ${b.contact_phone ?? null}, ${b.contact_email ?? null}, ${b.property_id ? Number(b.property_id) : null}) RETURNING id`;
         return json({ id: Number(r.id) });
       }
       m = path.match(/^\/api\/admin\/cleans\/(\d+)$/);
@@ -347,7 +497,7 @@ Deno.serve(async (req) => {
         if (!["requested", "declined", "open", "assigned", "confirmed", "done", "cancelled"].includes(n.status)) return bad("Bad status");
         await sql`UPDATE coastal.cleans SET date = ${n.date}, start_time = ${n.start_time}, duration_hours = ${n.duration_hours},
           client = ${n.client}, address = ${n.address ?? ""}, type = ${n.type}, notes = ${n.notes ?? ""}, status = ${n.status},
-          contact_name = ${n.contact_name ?? null}, contact_phone = ${n.contact_phone ?? null}, contact_email = ${n.contact_email ?? null} WHERE id = ${m[1]}`;
+          contact_name = ${n.contact_name ?? null}, contact_phone = ${n.contact_phone ?? null}, contact_email = ${n.contact_email ?? null}, property_id = ${n.property_id ? Number(n.property_id) : null} WHERE id = ${m[1]}`;
         return json({ ok: true });
       }
       if (m && method === "DELETE") { await sql`DELETE FROM coastal.cleans WHERE id = ${m[1]}`; return json({ ok: true }); }
@@ -403,7 +553,9 @@ Deno.serve(async (req) => {
         if (!DATE_RE.test(from) || !DATE_RE.test(to)) return bad("from/to required (YYYY-MM-DD)");
         const cleans = await sql`SELECT ${CLEAN_COLS}, cl.name AS cleaner_name,
           (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'crew' AND mm.sender = 'cleaner' AND NOT mm.seen)::int AS unread_crew,
-          (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'client' AND mm.sender = 'client' AND NOT mm.seen)::int AS unread_client
+          (SELECT count(*) FROM coastal.clean_messages mm WHERE mm.clean_id = c.id AND mm.thread = 'client' AND mm.sender = 'client' AND NOT mm.seen)::int AS unread_client,
+          (SELECT count(*) FROM coastal.clean_tasks t WHERE t.clean_id = c.id)::int AS tasks_total,
+          (SELECT count(*) FROM coastal.clean_tasks t WHERE t.clean_id = c.id AND t.done)::int AS tasks_done
           FROM coastal.cleans c LEFT JOIN coastal.cleaners cl ON cl.id = c.cleaner_id
           WHERE c.date BETWEEN ${from} AND ${to} AND c.status NOT IN ('cancelled','requested','declined') ORDER BY c.date, c.start_time`;
         const availability = await sql`SELECT ${AVAIL_COLS}, cl.name FROM coastal.availability a JOIN coastal.cleaners cl ON cl.id = a.cleaner_id
@@ -431,7 +583,7 @@ Deno.serve(async (req) => {
             if (cand.conflict) problems.push(`overlaps ${cand.conflict}`);
           }
           if (problems.length && !body.force) return bad(problems.join("; "), 409, { needs_force: true });
-          await sql`UPDATE coastal.cleans SET cleaner_id = ${cleaner.id}, status = 'assigned' WHERE id = ${c.id}`;
+          await sql`UPDATE coastal.cleans SET cleaner_id = ${cleaner.id}, status = 'assigned', release_note = NULL WHERE id = ${c.id}`;
           return json({ ok: true, warnings: problems });
         }
       }
